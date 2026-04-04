@@ -4,17 +4,18 @@ const app = express();
 
 const PORT = process.env.PORT || 3000;
 
-// Serve static files
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Main route
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+app.get('/config', (req, res) => {
+  res.json({ token: process.env.DERIV_TOKEN || '' });
 });
 
-// Health check for Render
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', bot: 'GOLD BOT XAU/USD', time: new Date().toISOString() });
+});
+
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 app.listen(PORT, () => {
