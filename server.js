@@ -8,9 +8,6 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ═══════════════════════════════════════════
-//  BOT STATE
-// ═══════════════════════════════════════════
 const BOT = {
   ws: null,
   token: process.env.DERIV_TOKEN || null,
@@ -30,9 +27,6 @@ const BOT = {
   rTimer: null,
 };
 
-// ═══════════════════════════════════════════
-//  INDICATORS
-// ═══════════════════════════════════════════
 function ema(d, n) {
   if (d.length < n) return d[d.length - 1];
   const k = 2 / (n + 1);
@@ -61,41 +55,42 @@ function atr(d, n = 14) {
 }
 
 function priceAction(d) {
-  if (d.length < 10) return { pattern: 'loading', bias: 'neutral' };
+  if (d.length < 10) return { bias: 'neutral' };
   const recent = d.slice(-20);
   const n = recent.length;
   let highs = [], lows = [];
   for (let i = 1; i < n - 1; i++) {
-    if (recent[i] > recent[i - 1] && recent[i] > recent[i + 1]) highs.push({ i, v: recent[i] });
-    if (recent[i] < recent[i - 1] && recent[i] < recent[i + 1]) lows.push({ i, v: recent[i] });
+    if (recent[i] > recent[i-1] && recent[i] > recent[i+1]) highs.push(recent[i]);
+    if (recent[i] < recent[i-1] && recent[i] < recent[i+1]) lows.push(recent[i]);
   }
   const last = d[d.length - 1];
-  let pattern = 'consolidation', bias = 'neutral';
+  let bias = 'neutral';
   if (highs.length >= 2 && lows.length >= 2) {
-    const hh = highs[highs.length - 1].v > highs[highs.length - 2].v;
-    const hl = lows[lows.length - 1].v > lows[lows.length - 2].v;
-    const lh = highs[highs.length - 1].v < highs[highs.length - 2].v;
-    const ll = lows[lows.length - 1].v < lows[lows.length - 2].v;
-    if (hh && hl) { pattern = 'HH+HL'; bias = 'buy'; }
-    else if (lh && ll) { pattern = 'LH+LL'; bias = 'sell'; }
+    const hh = highs[highs.length-1] > highs[highs.length-2];
+    const hl = lows[lows.length-1] > lows[lows.length-2];
+    const lh = highs[highs.length-1] < highs[highs.length-2];
+    const ll = lows[lows.length-1] < lows[lows.length-2];
+    if (hh && hl) bias = 'buy';
+    else if (lh && ll) bias = 'sell';
   }
-  const prevMax = Math.max(...d.slice(-15, -5));
-  const prevMin = Math.min(...d.slice(-15, -5));
-  if (last > prevMax * 1.0002) { pattern = 'Cassure haussiere'; bias = 'buy'; }
-  else if (last < prevMin * 0.9998) { pattern = 'Cassure baissiere'; bias = 'sell'; }
-  return { pattern, bias };
+  if (d.length >= 15) {
+    const prevMax = Math.max(...d.slice(-15, -5));
+    const prevMin = Math.min(...d.slice(-15, -5));
+    if (last > prevMax * 1.0002) bias = 'buy';
+    else if (last < prevMin * 0.9998) bias = 'sell';
+  }
+  return { bias };
 }
 
 function fibonacci(d) {
-  if (d.length < 20) return { levels: {}, nearLevel: null, bias: 'neutral' };
+  if (d.length < 20) return { nearLevel: null, bias: 'neutral' };
   const slice = d.slice(-50);
   const high = Math.max(...slice);
   const low = Math.min(...slice);
   const range = high - low;
   const last = d[d.length - 1];
-  const ratios = [0, 0.236, 0.382, 0.5, 0.618, 1.0];
   const levels = {};
-  for (const r of ratios) levels[r] = high - range * r;
+  for (const r of [0, 0.236, 0.382, 0.5, 0.618, 1.0]) levels[r] = high - range * r;
   const tolerance = atr(d) * 1.5;
   let nearLevel = null, bias = 'neutral';
   for (const r of [0.382, 0.5, 0.618]) {
@@ -105,7 +100,7 @@ function fibonacci(d) {
       break;
     }
   }
-  return { levels, nearLevel, bias };
+  return { nearLevel, bias };
 }
 
 function analyze(data) {
@@ -115,30 +110,26 @@ function analyze(data) {
   const atrVal = atr(data);
   const pa = priceAction(data);
   const fib = fibonacci(data);
-
   let bs = 0, ss = 0, reasons = [];
 
   const emaBull = last > e20 && e20 > e50;
   const emaBear = last < e20 && e20 < e50;
-  const strongBull = emaBull && e50 > e200;
-  const strongBear = emaBear && e50 < e200;
-
-  if (strongBull) { bs += 3; reasons.push('EMA triple haussier'); }
-  else if (emaBull) { bs += 1.8; }
-  else if (strongBear) { ss += 3; reasons.push('EMA triple baissier'); }
-  else if (emaBear) { ss += 1.8; }
+  if (emaBull && e50 > e200) { bs += 3; reasons.push('EMA triple haussier'); }
+  else if (emaBull) bs += 1.8;
+  else if (emaBear && e50 < e200) { ss += 3; reasons.push('EMA triple baissier'); }
+  else if (emaBear) ss += 1.8;
 
   if (r < 35) { bs += 2; reasons.push('RSI survente'); }
   else if (r < 45 && emaBull) bs += 1;
   else if (r > 65) { ss += 2; reasons.push('RSI surachat'); }
   else if (r > 55 && emaBear) ss += 1;
 
-  if (pa.bias === 'buy') { bs += 2.5; }
-  else if (pa.bias === 'sell') { ss += 2.5; }
+  if (pa.bias === 'buy') bs += 2.5;
+  else if (pa.bias === 'sell') ss += 2.5;
 
   if (fib.nearLevel) {
-    if (fib.bias === 'buy') { bs += 2; reasons.push(`Fib ${Math.round(fib.nearLevel * 100)}% support`); }
-    else if (fib.bias === 'sell') { ss += 2; reasons.push(`Fib ${Math.round(fib.nearLevel * 100)}% resistance`); }
+    if (fib.bias === 'buy') { bs += 2; reasons.push(`Fib ${Math.round(fib.nearLevel*100)}% support`); }
+    else if (fib.bias === 'sell') { ss += 2; reasons.push(`Fib ${Math.round(fib.nearLevel*100)}% resistance`); }
   }
 
   const relAtr = atrVal / last * 100;
@@ -149,15 +140,9 @@ function analyze(data) {
   if (bs > ss && conf >= 45) signal = 'BUY';
   else if (ss > bs && conf >= 45) signal = 'SELL';
 
-  const sl = signal === 'BUY' ? last - atrVal * 1.8 : signal === 'SELL' ? last + atrVal * 1.8 : null;
-  const tp = signal === 'BUY' ? last + atrVal * 2.8 : signal === 'SELL' ? last - atrVal * 2.8 : null;
-
-  return { signal, confidence: conf, last, sl, tp, rsi: r, reason: reasons.slice(0, 2).join(' + ') || 'analyse...' };
+  return { signal, confidence: conf, last, rsi: r, reason: reasons.slice(0,2).join(' + ') || 'analyse...' };
 }
 
-// ═══════════════════════════════════════════
-//  MARKET HOURS
-// ═══════════════════════════════════════════
 function isMarketOpen() {
   const now = new Date();
   const day = now.getUTCDay();
@@ -166,25 +151,13 @@ function isMarketOpen() {
   return h >= 0 && h < 21;
 }
 
-function isBestSession() {
-  const now = new Date();
-  const t = now.getUTCHours() * 60 + now.getUTCMinutes();
-  return t >= 7 * 60 && t < 17 * 60;
-}
-
-// ═══════════════════════════════════════════
-//  WEBSOCKET BOT
-// ═══════════════════════════════════════════
 function send(o) {
-  if (BOT.ws && BOT.ws.readyState === WebSocket.OPEN) {
-    BOT.ws.send(JSON.stringify(o));
-  }
+  if (BOT.ws && BOT.ws.readyState === WebSocket.OPEN) BOT.ws.send(JSON.stringify(o));
 }
 
 function startBot() {
-  if (!BOT.token) { console.log('No token — bot not started'); return; }
-  if (BOT.ws) { BOT.ws.terminate(); }
-
+  if (!BOT.token) { console.log('No token — bot stopped'); return; }
+  if (BOT.ws) { try { BOT.ws.terminate(); } catch(e) {} }
   console.log('Starting Gold Bot...');
   BOT.ws = new WebSocket('wss://ws.binaryws.com/websockets/v3?app_id=1089&l=EN&brand=deriv');
 
@@ -194,22 +167,29 @@ function startBot() {
   });
 
   BOT.ws.on('message', (data) => {
-    const d = JSON.parse(data);
-    const t = d.msg_type;
-    if (t === 'authorize') onAuth(d);
-    else if (t === 'tick') onTick(d.tick);
-    else if (t === 'proposal') onProposal(d);
-    else if (t === 'buy') onBuy(d);
-    else if (t === 'proposal_open_contract') onContract(d);
-    else if (t === 'balance') { if (d.balance) BOT.balance = parseFloat(d.balance.balance); }
+    try {
+      const d = JSON.parse(data);
+      const t = d.msg_type;
+      if (t === 'authorize') onAuth(d);
+      else if (t === 'tick') onTick(d.tick);
+      else if (t === 'proposal') onProposal(d);
+      else if (t === 'buy') onBuy(d);
+      else if (t === 'proposal_open_contract') onContract(d);
+      else if (t === 'balance' && d.balance) BOT.balance = parseFloat(d.balance.balance);
+    } catch(e) {
+      console.log('Message error:', e.message);
+    }
   });
 
   BOT.ws.on('close', () => {
     console.log('Disconnected — reconnecting in 5s');
+    clearTimeout(BOT.rTimer);
     BOT.rTimer = setTimeout(startBot, 5000);
   });
 
-  BOT.ws.on('error', (e) => console.log('WS error:', e.message));
+  BOT.ws.on('error', (e) => {
+    console.log('WS error:', e.message);
+  });
 }
 
 function onAuth(d) {
@@ -222,17 +202,19 @@ function onAuth(d) {
 }
 
 function onTick(tick) {
+  // Guard against empty tick (market closed)
+  if (!tick || tick.quote === undefined || tick.quote === null) return;
   const p = parseFloat(tick.quote);
+  if (isNaN(p)) return;
+
   BOT.prices.push(p);
   if (BOT.prices.length > BOT.MAX) BOT.prices.shift();
 
-  if (BOT.prices.length >= BOT.MIN && !BOT.openCtr) {
+  if (BOT.prices.length >= BOT.MIN && !BOT.openCtr && isMarketOpen()) {
     const a = analyze(BOT.prices);
-    if (a.signal !== 'WAIT' && a.confidence >= 55 && a.signal !== BOT.lastSig) {
-      if (isMarketOpen()) {
-        console.log(`Signal: ${a.signal} | Conf: ${a.confidence.toFixed(0)}% | ${a.reason}`);
-        placeTrade(a.signal);
-      }
+    if (a.signal !== 'WAIT' && a.confidence >= 45 && a.signal !== BOT.lastSig) {
+      console.log(`Signal: ${a.signal} | ${a.confidence.toFixed(0)}% | ${a.reason}`);
+      placeTrade(a.signal);
     }
   }
 }
@@ -240,11 +222,10 @@ function onTick(tick) {
 function placeTrade(signal) {
   const stake = parseFloat((BOT.balance * 0.02).toFixed(2));
   if (stake < 1) { console.log('Balance too low'); return; }
-  const ctype = signal === 'BUY' ? 'CALL' : 'PUT';
   BOT.lastSig = signal;
   send({
     proposal: 1,
-    contract_type: ctype,
+    contract_type: signal === 'BUY' ? 'CALL' : 'PUT',
     symbol: BOT.SYM,
     duration: 5,
     duration_unit: 'm',
@@ -252,7 +233,7 @@ function placeTrade(signal) {
     amount: stake,
     currency: 'USD',
   });
-  console.log(`Placing ${signal} trade — $${stake}`);
+  console.log(`Placing ${signal} — $${stake}`);
 }
 
 function onProposal(d) {
@@ -267,17 +248,16 @@ function onBuy(d) {
   const b = d.buy;
   BOT.openCtr = b.contract_id;
   BOT.nTrades++;
-  const trade = {
+  BOT.trades.unshift({
     id: b.contract_id,
     signal: BOT.lastSig,
     price: parseFloat(b.buy_price),
     time: new Date().toISOString(),
     status: 'pending',
     pnl: null,
-  };
-  BOT.trades.unshift(trade);
+  });
   if (BOT.trades.length > 20) BOT.trades.pop();
-  console.log(`Trade placed — ID: ${b.contract_id} — $${b.buy_price}`);
+  console.log(`Trade placed — ${BOT.lastSig} — $${b.buy_price}`);
   send({ proposal_open_contract: 1, contract_id: b.contract_id, subscribe: 1 });
 }
 
@@ -291,44 +271,29 @@ function onContract(d) {
     if (pnl >= 0) BOT.wins++; else BOT.losses++;
     const t = BOT.trades.find(x => x.id == c.contract_id);
     if (t) { t.status = pnl >= 0 ? 'win' : 'loss'; t.pnl = pnl; }
-    console.log(`Trade closed — ${pnl >= 0 ? 'WIN' : 'LOSS'} $${Math.abs(pnl).toFixed(2)} | P&L: $${BOT.pnl.toFixed(2)}`);
+    console.log(`${pnl >= 0 ? 'WIN' : 'LOSS'} $${Math.abs(pnl).toFixed(2)} | P&L: $${BOT.pnl.toFixed(2)}`);
     if (c.id) send({ forget: c.id });
   }
 }
 
-// ═══════════════════════════════════════════
-//  API ROUTES
-// ═══════════════════════════════════════════
-app.get('/config', (req, res) => {
-  res.json({ token: process.env.DERIV_TOKEN || '' });
-});
+app.get('/config', (req, res) => res.json({ token: process.env.DERIV_TOKEN || '' }));
 
-app.get('/status', (req, res) => {
-  res.json({
-    running: BOT.running,
-    balance: BOT.balance,
-    pnl: BOT.pnl,
-    wins: BOT.wins,
-    losses: BOT.losses,
-    nTrades: BOT.nTrades,
-    trades: BOT.trades.slice(0, 10),
-    marketOpen: isMarketOpen(),
-    bestSession: isBestSession(),
-    lastPrice: BOT.prices[BOT.prices.length - 1] || null,
-  });
-});
+app.get('/status', (req, res) => res.json({
+  running: BOT.running,
+  balance: BOT.balance,
+  pnl: BOT.pnl,
+  wins: BOT.wins,
+  losses: BOT.losses,
+  nTrades: BOT.nTrades,
+  trades: BOT.trades.slice(0, 10),
+  marketOpen: isMarketOpen(),
+  lastPrice: BOT.prices[BOT.prices.length - 1] || null,
+}));
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', bot: 'GOLD BOT XAU/USD', time: new Date().toISOString() });
-});
+app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
 
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
-// ═══════════════════════════════════════════
-//  START
-// ═══════════════════════════════════════════
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   startBot();
