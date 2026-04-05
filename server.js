@@ -146,9 +146,11 @@ function analyze(data) {
 function isMarketOpen() {
   const now = new Date();
   const day = now.getUTCDay();
-  if (day === 0 || day === 6) return false;
   const h = now.getUTCHours();
-  return h >= 0 && h < 21;
+  if (day === 6) return false;
+  if (day === 0 && h < 22) return false;
+  if (day === 5 && h >= 21) return false;
+  return true;
 }
 
 function send(o) {
