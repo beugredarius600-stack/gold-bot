@@ -4,7 +4,6 @@ const WebSocket = require('ws');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -16,7 +15,6 @@ const BOT = {
   token: process.env.DERIV_TOKEN || null,
   running: false,
   balance: 0,
-  prices: [],
   lastSig: null,
   openCtr: null,
   trades: [],
@@ -25,10 +23,55 @@ const BOT = {
   losses: 0,
   nTrades: 0,
   SYM: 'R_75',
-  MIN: 30,
-  MAX: 300,
   rTimer: null,
+  // Candle builders
+  ticks: [],        // raw ticks
+  candles: {
+    m5:  [],        // 5min candles
+    m15: [],        // 15min candles
+    m30: [],        // 30min candles
+  },
+  currentCandle: {
+    m5:  null,
+    m15: null,
+    m30: null,
+  },
 };
+
+const TF = { m5: 5*60*1000, m15: 15*60*1000, m30: 30*60*1000 };
+const MAX_CANDLES = 50;
+
+// ═══════════════════════════════════════════
+//  CANDLE BUILDER
+// ═══════════════════════════════════════════
+function updateCandles(price, timestamp) {
+  for (const tf of ['m5', 'm15', 'm30']) {
+    const period = TF[tf];
+    const candleTime = Math.floor(timestamp / period) * period;
+
+    if (!BOT.currentCandle[tf] || BOT.currentCandle[tf].time !== candleTime) {
+      // Close previous candle
+      if (BOT.currentCandle[tf]) {
+        BOT.candles[tf].push(BOT.currentCandle[tf]);
+        if (BOT.candles[tf].length > MAX_CANDLES) BOT.candles[tf].shift();
+      }
+      // Open new candle
+      BOT.currentCandle[tf] = { time: candleTime, open: price, high: price, low: price, close: price };
+    } else {
+      // Update current candle
+      const c = BOT.currentCandle[tf];
+      c.high = Math.max(c.high, price);
+      c.low = Math.min(c.low, price);
+      c.close = price;
+    }
+  }
+}
+
+function getClosePrices(tf) {
+  const candles = [...BOT.candles[tf]];
+  if (BOT.currentCandle[tf]) candles.push(BOT.currentCandle[tf]);
+  return candles.map(c => c.close);
+}
 
 // ═══════════════════════════════════════════
 //  INDICATORS
@@ -66,72 +109,97 @@ function bollinger(d, n = 20) {
   return { upper, lower, middle: m, pct: Math.max(0, Math.min(1, pct)), width };
 }
 
-// ═══════════════════════════════════════════
-//  STRATEGY — Pure V75
-//  BB + RSI + EMA crossover
-// ═══════════════════════════════════════════
-function analyze(data) {
-  const last = data[data.length - 1];
-  const r = rsi(data);
-  const bb = bollinger(data);
-  const e9 = ema(data, 9);
-  const e21 = ema(data, 21);
-
-  // EMA crossover detection
-  const prev = data.slice(0, -1);
+function analyzeTimeframe(prices) {
+  if (prices.length < 20) return { signal: 'WAIT', score: 0 };
+  const last = prices[prices.length - 1];
+  const r = rsi(prices);
+  const bb = bollinger(prices);
+  const e9 = ema(prices, 9);
+  const e21 = ema(prices, 21);
+  const prev = prices.slice(0, -1);
   const pe9 = ema(prev, 9);
   const pe21 = ema(prev, 21);
-  const crossUp = pe9 <= pe21 && e9 > e21;   // EMA 9 crosses above 21
-  const crossDown = pe9 >= pe21 && e9 < e21; // EMA 9 crosses below 21
+  const crossUp = pe9 <= pe21 && e9 > e21;
+  const crossDown = pe9 >= pe21 && e9 < e21;
+
+  let buyScore = 0, sellScore = 0;
+
+  // BB
+  if (bb.pct < 0.10) buyScore += 40;
+  else if (bb.pct < 0.20) buyScore += 25;
+  if (bb.pct > 0.90) sellScore += 40;
+  else if (bb.pct > 0.80) sellScore += 25;
+
+  // RSI
+  if (r < 25) buyScore += 40;
+  else if (r < 35) buyScore += 25;
+  if (r > 75) sellScore += 40;
+  else if (r > 65) sellScore += 25;
+
+  // EMA
+  if (crossUp) buyScore += 20;
+  else if (e9 > e21 * 1.0001) buyScore += 10;
+  if (crossDown) sellScore += 20;
+  else if (e9 < e21 * 0.9999) sellScore += 10;
+
+  const score = Math.max(buyScore, sellScore);
+  let signal = 'WAIT';
+  if (buyScore > sellScore && buyScore >= 50) signal = 'BUY';
+  else if (sellScore > buyScore && sellScore >= 50) signal = 'SELL';
+
+  return { signal, score, rsi: r, bb, e9, e21 };
+}
+
+// ═══════════════════════════════════════════
+//  MULTI-TIMEFRAME CONFLUENCE
+// ═══════════════════════════════════════════
+function analyze() {
+  const p5  = getClosePrices('m5');
+  const p15 = getClosePrices('m15');
+  const p30 = getClosePrices('m30');
+
+  // Need minimum candles on each TF
+  if (p5.length < 20 || p15.length < 10 || p30.length < 5) {
+    return { signal: 'WAIT', confidence: 0, reason: 'accumulation données...' };
+  }
+
+  const tf5  = analyzeTimeframe(p5);
+  const tf15 = analyzeTimeframe(p15);
+  const tf30 = analyzeTimeframe(p30);
+
+  console.log(`M5:${tf5.signal}(${tf5.score}) M15:${tf15.signal}(${tf15.score}) M30:${tf30.signal}(${tf30.score})`);
+
+  // CONFLUENCE: all 3 timeframes must agree
+  const allBuy  = tf5.signal === 'BUY'  && tf15.signal === 'BUY'  && tf30.signal === 'BUY';
+  const allSell = tf5.signal === 'SELL' && tf15.signal === 'SELL' && tf30.signal === 'SELL';
+
+  // Also accept M15+M30 agreement with M5 neutral
+  const partialBuy  = (tf15.signal === 'BUY'  && tf30.signal === 'BUY')  && tf5.signal !== 'SELL';
+  const partialSell = (tf15.signal === 'SELL' && tf30.signal === 'SELL') && tf5.signal !== 'BUY';
 
   let signal = 'WAIT';
   let confidence = 0;
-  let reason = 'analyse...';
+  let reason = 'pas de confluence';
 
-  // ── BUY CONDITIONS ──
-  // Strong: BB lower touch + RSI oversold + EMA cross up
-  // Medium: BB lower + RSI oversold
-  // Medium: EMA cross up + RSI < 45
-
-  let buyScore = 0;
-  if (bb.pct < 0.15) buyScore += 35;       // Prix sur BB inferieure
-  else if (bb.pct < 0.25) buyScore += 20;
-  if (r < 30) buyScore += 35;              // RSI survente forte
-  else if (r < 40) buyScore += 20;
-  if (crossUp) buyScore += 20;             // EMA crossover haussier
-  else if (e9 > e21) buyScore += 10;       // EMA alignment
-
-  // ── SELL CONDITIONS ──
-  let sellScore = 0;
-  if (bb.pct > 0.85) sellScore += 35;      // Prix sur BB superieure
-  else if (bb.pct > 0.75) sellScore += 20;
-  if (r > 70) sellScore += 35;             // RSI surachat fort
-  else if (r > 60) sellScore += 20;
-  if (crossDown) sellScore += 20;          // EMA crossover baissier
-  else if (e9 < e21) sellScore += 10;      // EMA alignment
-
-  confidence = Math.max(buyScore, sellScore);
-
-  // Minimum 55% confidence to trade
-  if (buyScore > sellScore && confidence >= 55) {
+  if (allBuy) {
     signal = 'BUY';
-    const reasons = [];
-    if (bb.pct < 0.25) reasons.push('BB bas');
-    if (r < 40) reasons.push('RSI survente');
-    if (crossUp) reasons.push('EMA cross haussier');
-    else if (e9 > e21) reasons.push('EMA haussier');
-    reason = reasons.join(' + ');
-  } else if (sellScore > buyScore && confidence >= 55) {
+    confidence = Math.round((tf5.score + tf15.score + tf30.score) / 3);
+    reason = `M5+M15+M30 BUY | RSI:${tf5.rsi.toFixed(0)} BB:${(tf5.bb.pct*100).toFixed(0)}%`;
+  } else if (allSell) {
     signal = 'SELL';
-    const reasons = [];
-    if (bb.pct > 0.75) reasons.push('BB haut');
-    if (r > 60) reasons.push('RSI surachat');
-    if (crossDown) reasons.push('EMA cross baissier');
-    else if (e9 < e21) reasons.push('EMA baissier');
-    reason = reasons.join(' + ');
+    confidence = Math.round((tf5.score + tf15.score + tf30.score) / 3);
+    reason = `M5+M15+M30 SELL | RSI:${tf5.rsi.toFixed(0)} BB:${(tf5.bb.pct*100).toFixed(0)}%`;
+  } else if (partialBuy) {
+    signal = 'BUY';
+    confidence = Math.round((tf15.score + tf30.score) / 2) - 10;
+    reason = `M15+M30 BUY | RSI:${tf15.rsi.toFixed(0)}`;
+  } else if (partialSell) {
+    signal = 'SELL';
+    confidence = Math.round((tf15.score + tf30.score) / 2) - 10;
+    reason = `M15+M30 SELL | RSI:${tf15.rsi.toFixed(0)}`;
   }
 
-  return { signal, confidence: Math.min(confidence, 96), last, rsi: r, bb, e9, e21, reason };
+  return { signal, confidence: Math.min(confidence, 96), reason, tf5, tf15, tf30 };
 }
 
 // ═══════════════════════════════════════════
@@ -142,13 +210,13 @@ function send(o) {
 }
 
 function startBot() {
-  if (!BOT.token) { console.log('No token — bot stopped'); return; }
+  if (!BOT.token) { console.log('No token'); return; }
   if (BOT.ws) { try { BOT.ws.terminate(); } catch(e) {} }
-  console.log('Starting V75 Bot...');
+  console.log('Starting V75 Multi-TF Bot...');
   BOT.ws = new WebSocket('wss://ws.binaryws.com/websockets/v3?app_id=1089&l=EN&brand=deriv');
 
   BOT.ws.on('open', () => {
-    console.log('Connected to Deriv');
+    console.log('Connected');
     send({ authorize: BOT.token });
   });
 
@@ -163,7 +231,7 @@ function startBot() {
       else if (t === 'proposal_open_contract') onContract(d);
       else if (t === 'balance' && d.balance) BOT.balance = parseFloat(d.balance.balance);
     } catch(e) {
-      console.log('Message error:', e.message);
+      console.log('Error:', e.message);
     }
   });
 
@@ -190,13 +258,13 @@ function onTick(tick) {
   const p = parseFloat(tick.quote);
   if (isNaN(p)) return;
 
-  BOT.prices.push(p);
-  if (BOT.prices.length > BOT.MAX) BOT.prices.shift();
+  const ts = tick.epoch ? tick.epoch * 1000 : Date.now();
+  updateCandles(p, ts);
 
-  if (BOT.prices.length >= BOT.MIN && !BOT.openCtr) {
-    const a = analyze(BOT.prices);
-    if (a.signal !== 'WAIT' && a.signal !== BOT.lastSig) {
-      console.log(`Signal: ${a.signal} | Conf: ${a.confidence}% | ${a.reason}`);
+  if (!BOT.openCtr) {
+    const a = analyze();
+    if (a.signal !== 'WAIT' && a.confidence >= 55 && a.signal !== BOT.lastSig) {
+      console.log(`TRADE SIGNAL: ${a.signal} | ${a.confidence}% | ${a.reason}`);
       placeTrade(a.signal);
     }
   }
@@ -210,8 +278,8 @@ function placeTrade(signal) {
     proposal: 1,
     contract_type: signal === 'BUY' ? 'CALL' : 'PUT',
     symbol: BOT.SYM,
-    duration: 3,
-    duration_unit: 't',
+    duration: 5,
+    duration_unit: 'm',
     basis: 'stake',
     amount: stake,
     currency: 'USD',
@@ -260,7 +328,7 @@ function onContract(d) {
 }
 
 // ═══════════════════════════════════════════
-//  API ROUTES
+//  ROUTES
 // ═══════════════════════════════════════════
 app.get('/config', (req, res) => res.json({ token: process.env.DERIV_TOKEN || '' }));
 
@@ -268,23 +336,27 @@ app.get('/status', (req, res) => res.json({
   running: BOT.running,
   symbol: BOT.SYM,
   balance: BOT.balance,
-  pnl: BOT.pnl,
+  pnl: parseFloat(BOT.pnl.toFixed(2)),
   wins: BOT.wins,
   losses: BOT.losses,
   nTrades: BOT.nTrades,
   winRate: BOT.nTrades > 0 ? ((BOT.wins / BOT.nTrades) * 100).toFixed(1) + '%' : '--',
+  candles: {
+    m5: BOT.candles.m5.length,
+    m15: BOT.candles.m15.length,
+    m30: BOT.candles.m30.length,
+  },
   trades: BOT.trades.slice(0, 10),
-  lastPrice: BOT.prices[BOT.prices.length - 1] || null,
+  lastPrice: BOT.candles.m5.length > 0 ? BOT.candles.m5[BOT.candles.m5.length-1].close : null,
 }));
 
 app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
-
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
 // ═══════════════════════════════════════════
 //  START
 // ═══════════════════════════════════════════
 app.listen(PORT, () => {
-  console.log(`V75 Bot server on port ${PORT}`);
+  console.log(`V75 Multi-TF Bot on port ${PORT}`);
   startBot();
 });
