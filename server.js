@@ -152,6 +152,8 @@ function analyzeTimeframe(prices) {
 
 // ═══════════════════════════════════════════
 //  MULTI-TIMEFRAME CONFLUENCE
+//  FIX: Confluence stricte M5+M15+M30 uniquement
+//  Suppression de la confluence partielle M15+M30
 // ═══════════════════════════════════════════
 function analyze() {
   const p5  = getClosePrices('m5');
@@ -169,13 +171,9 @@ function analyze() {
 
   console.log(`M5:${tf5.signal}(${tf5.score}) M15:${tf15.signal}(${tf15.score}) M30:${tf30.signal}(${tf30.score})`);
 
-  // CONFLUENCE: all 3 timeframes must agree
+  // CONFLUENCE STRICTE: les 3 TF doivent être d'accord — pas d'exception
   const allBuy  = tf5.signal === 'BUY'  && tf15.signal === 'BUY'  && tf30.signal === 'BUY';
   const allSell = tf5.signal === 'SELL' && tf15.signal === 'SELL' && tf30.signal === 'SELL';
-
-  // Also accept M15+M30 agreement with M5 neutral
-  const partialBuy  = (tf15.signal === 'BUY'  && tf30.signal === 'BUY')  && tf5.signal !== 'SELL';
-  const partialSell = (tf15.signal === 'SELL' && tf30.signal === 'SELL') && tf5.signal !== 'BUY';
 
   let signal = 'WAIT';
   let confidence = 0;
@@ -189,14 +187,6 @@ function analyze() {
     signal = 'SELL';
     confidence = Math.round((tf5.score + tf15.score + tf30.score) / 3);
     reason = `M5+M15+M30 SELL | RSI:${tf5.rsi.toFixed(0)} BB:${(tf5.bb.pct*100).toFixed(0)}%`;
-  } else if (partialBuy) {
-    signal = 'BUY';
-    confidence = Math.round((tf15.score + tf30.score) / 2) - 10;
-    reason = `M15+M30 BUY | RSI:${tf15.rsi.toFixed(0)}`;
-  } else if (partialSell) {
-    signal = 'SELL';
-    confidence = Math.round((tf15.score + tf30.score) / 2) - 10;
-    reason = `M15+M30 SELL | RSI:${tf15.rsi.toFixed(0)}`;
   }
 
   return { signal, confidence: Math.min(confidence, 96), reason, tf5, tf15, tf30 };
@@ -263,7 +253,9 @@ function onTick(tick) {
 
   if (!BOT.openCtr) {
     const a = analyze();
-    if (a.signal !== 'WAIT' && a.confidence >= 55 && a.signal !== BOT.lastSig) {
+    // FIX 1: Suppression du filtre lastSig (plus d'alternance forcée SELL/BUY)
+    // FIX 2: Seuil de confiance relevé à 70% minimum
+    if (a.signal !== 'WAIT' && a.confidence >= 70) {
       console.log(`TRADE SIGNAL: ${a.signal} | ${a.confidence}% | ${a.reason}`);
       placeTrade(a.signal);
     }
@@ -271,7 +263,8 @@ function onTick(tick) {
 }
 
 function placeTrade(signal) {
-  const stake = parseFloat((BOT.balance * 0.02).toFixed(2));
+  // FIX 3: Risque porté à 3% du solde par trade (au lieu de 2%)
+  const stake = parseFloat((BOT.balance * 0.03).toFixed(2));
   if (stake < 0.35) { console.log('Balance too low'); return; }
   BOT.lastSig = signal;
   send({
@@ -357,6 +350,6 @@ app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.ht
 //  START
 // ═══════════════════════════════════════════
 app.listen(PORT, () => {
-  console.log(`V75 Multi-TF Bot on port ${PORT}`);
+  console.log(`V75 Multi-TF Bot v2 on port ${PORT}`);
   startBot();
 });
