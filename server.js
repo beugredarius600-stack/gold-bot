@@ -346,7 +346,8 @@ function startBot() {
           status: 'pending',
           pnl:    null,
         });
-        if (BOT.trades.length > 20) BOT.trades.pop();
+        // ✅ FIX — garder 50 trades en mémoire (au lieu de 20)
+        if (BOT.trades.length > 50) BOT.trades.pop();
         console.log(`🔵 Trade #${BOT.nTrades} — ${BOT.lastSignal} ${BOT.lastSymbol} — $${d.buy.buy_price}`);
         send({ proposal_open_contract: 1, contract_id: d.buy.contract_id, subscribe: 1 });
       }
@@ -440,9 +441,43 @@ app.get('/status', (req, res) => res.json({
     R_75: { m1: MARKETS['R_75']?.candles.m1.length, m5: MARKETS['R_75']?.candles.m5.length, m15: MARKETS['R_75']?.candles.m15.length },
     R_50: { m1: MARKETS['R_50']?.candles.m1.length, m5: MARKETS['R_50']?.candles.m5.length, m15: MARKETS['R_50']?.candles.m15.length },
   },
-  trades:    BOT.trades.slice(0, 10),
+  // ✅ FIX — retourne les 20 derniers trades (au lieu de 10)
+  trades:    BOT.trades.slice(0, 20),
   config:    CONFIG,
 }));
+
+// ✅ NOUVEAU — endpoint /history avec stats complètes par paire
+app.get('/history', (req, res) => {
+  const stats = {};
+  for (const s of SYMBOLS) {
+    const symTrades = BOT.trades.filter(t => t.symbol === s && t.status !== 'pending');
+    const wins      = symTrades.filter(t => t.status === 'win').length;
+    const losses    = symTrades.filter(t => t.status === 'loss').length;
+    const total     = wins + losses;
+    const pnl       = symTrades.reduce((sum, t) => sum + (t.pnl || 0), 0);
+    const buys      = symTrades.filter(t => t.signal === 'BUY').length;
+    const sells     = symTrades.filter(t => t.signal === 'SELL').length;
+    stats[s] = {
+      wins,
+      losses,
+      total,
+      winRate:  total > 0 ? ((wins / total) * 100).toFixed(1) + '%' : '--',
+      pnl:      parseFloat(pnl.toFixed(2)),
+      buys,
+      sells,
+    };
+  }
+
+  res.json({
+    totalTrades:   BOT.nTrades,
+    globalWins:    BOT.wins,
+    globalLosses:  BOT.losses,
+    globalWinRate: BOT.nTrades > 0 ? ((BOT.wins / BOT.nTrades) * 100).toFixed(1) + '%' : '--',
+    globalPnl:     parseFloat(BOT.pnl.toFixed(2)),
+    bySymbol:      stats,
+    allTrades:     BOT.trades,
+  });
+});
 
 app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
