@@ -11,14 +11,14 @@ app.use(express.static(path.join(__dirname, 'public')));
 //  CONFIG
 // ═══════════════════════════════════════════
 const CONFIG = {
-  RISK_PCT:       0.015,           // 1.5% par trade — conservateur
+  RISK_PCT:       0.03,            // 3% par trade
   COOLDOWN_MS:    3 * 60 * 1000,   // 3 min entre trades
   LOSS_PAUSE_MS:  30 * 60 * 1000,  // pause 30 min après 3 pertes
   MAX_LOSSES:     3,               // max pertes consécutives avant pause
   MIN_BALANCE:    0.35,
 };
 
-const SYMBOLS = ['R_75', 'R_50'];
+const SYMBOLS = ['R_75']; // R_50 désactivé — performances insuffisantes
 
 // ═══════════════════════════════════════════
 //  STATE
@@ -439,7 +439,6 @@ app.get('/status', (req, res) => res.json({
   regimes:     BOT.lastRegime,
   candles: {
     R_75: { m1: MARKETS['R_75']?.candles.m1.length, m5: MARKETS['R_75']?.candles.m5.length, m15: MARKETS['R_75']?.candles.m15.length },
-    R_50: { m1: MARKETS['R_50']?.candles.m1.length, m5: MARKETS['R_50']?.candles.m5.length, m15: MARKETS['R_50']?.candles.m15.length },
   },
   // ✅ FIX — retourne les 20 derniers trades (au lieu de 10)
   trades:    BOT.trades.slice(0, 20),
@@ -487,7 +486,7 @@ app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.ht
 // ═══════════════════════════════════════════
 app.listen(PORT, () => {
   console.log(`\n🤖 V8 Bot — port ${PORT}`);
-  console.log(`📊 Risk:${CONFIG.RISK_PCT*100}% | Pause après ${CONFIG.MAX_LOSSES} pertes | Marchés: ${SYMBOLS.join(', ')}`);
+  console.log(`📊 Risk:${CONFIG.RISK_PCT*100}% | Pause après ${CONFIG.MAX_LOSSES} pertes | Marché: R_75 uniquement`);
   console.log(`🧠 Logique: Détection régime (TREND/RANGE) → stratégie adaptée\n`);
   startBot();
 });
