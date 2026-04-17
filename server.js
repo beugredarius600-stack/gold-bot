@@ -11,7 +11,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 //  CONFIG
 // ═══════════════════════════════════════════
 const CONFIG = {
-  RISK_PCT:       0.03,            // 3% par trade
+  RISK_PCT:       0.02,            // 2% par trade — prudent après 46.5% winrate
   COOLDOWN_MS:    3 * 60 * 1000,   // 3 min entre trades
   LOSS_PAUSE_MS:  30 * 60 * 1000,  // pause 30 min après 3 pertes
   MAX_LOSSES:     3,               // max pertes consécutives avant pause
@@ -196,12 +196,14 @@ function stratTrend(symbol) {
   if (!e9_15 || !e21_15 || !e9_5 || !e21_5 || !r5) return null;
 
   // Tendance haussière M15 + M5 aligné + RSI momentum
-  if (e9_15 > e21_15 && e9_5 > e21_5 && r5 > 45 && r5 < 72) {
+  // ✅ FIX — conditions assouplies pour permettre plus de BUY
+  if (e9_15 > e21_15 && e9_5 > e21_5 && r5 > 38 && r5 < 75) {
     return { signal: 'BUY',  strength: 3, reason: `TREND BUY  | EMA M15+M5 haussières | RSI:${r5.toFixed(0)}` };
   }
 
   // Tendance baissière M15 + M5 aligné + RSI momentum
-  if (e9_15 < e21_15 && e9_5 < e21_5 && r5 < 55 && r5 > 28) {
+  // ✅ FIX — fenêtre RSI SELL plus stricte pour éviter faux signaux
+  if (e9_15 < e21_15 && e9_5 < e21_5 && r5 < 58 && r5 > 25) {
     return { signal: 'SELL', strength: 3, reason: `TREND SELL | EMA M15+M5 baissières | RSI:${r5.toFixed(0)}` };
   }
 
@@ -403,8 +405,8 @@ function startBot() {
 function placeTrade(symbol, signal) {
   const stake    = parseFloat((BOT.balance * CONFIG.RISK_PCT).toFixed(2));
   if (stake < CONFIG.MIN_BALANCE) { console.log('❌ Balance trop faible'); return; }
-  const durations = [3, 4, 5, 6];
-  const duration  = durations[Math.floor(Math.random() * durations.length)];
+  // ✅ FIX — durée fixe 5 min pour plus de stabilité
+  const duration = 5;
   send({
     proposal:      1,
     contract_type: signal === 'BUY' ? 'CALL' : 'PUT',
@@ -485,8 +487,8 @@ app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.ht
 //  START
 // ═══════════════════════════════════════════
 app.listen(PORT, () => {
-  console.log(`\n🤖 V8 Bot — port ${PORT}`);
-  console.log(`📊 Risk:${CONFIG.RISK_PCT*100}% | Pause après ${CONFIG.MAX_LOSSES} pertes | Marché: R_75 uniquement`);
-  console.log(`🧠 Logique: Détection régime (TREND/RANGE) → stratégie adaptée\n`);
+  console.log(`\n🤖 V9 Bot — port ${PORT}`);
+  console.log(`📊 Risk:${CONFIG.RISK_PCT*100}% | Durée:5min fixe | Pause après ${CONFIG.MAX_LOSSES} pertes | Marché: R_75 uniquement`);
+  console.log(`🧠 Logique: Détection régime (TREND/RANGE) → stratégie adaptée — BUY/SELL équilibrés\n`);
   startBot();
 });
