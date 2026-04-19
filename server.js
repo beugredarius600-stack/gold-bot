@@ -144,116 +144,147 @@ function volatility(d, n = 20) {
 }
 
 // ═══════════════════════════════════════════
-//  DÉTECTION DE RÉGIME
-//  TREND = marché directionnel
-//  RANGE = marché en consolidation
-//  Seuils abaissés pour détecter tôt
+//  UTILITAIRES PRICE ACTION
+// ═══════════════════════════════════════════
+
+// Détecte Higher High / Lower Low sur N bougies M5
+function marketStructure(symbol) {
+  const c = candles(symbol, 'm5');
+  if (c.length < 10) return null;
+
+  const recent = c.slice(-10);
+  const highs  = recent.map(x => x.high);
+  const lows   = recent.map(x => x.low);
+
+  const hh = highs[highs.length - 1] > Math.max(...highs.slice(0, -1));
+  const ll  = lows[lows.length - 1]  < Math.min(...lows.slice(0, -1));
+  const lh  = highs[highs.length - 1] < Math.max(...highs.slice(0, -1));
+  const hl  = lows[lows.length - 1]  > Math.min(...lows.slice(0, -1));
+
+  if (hh && hl) return 'BULLISH'; // Higher High + Higher Low = structure haussière
+  if (ll && lh) return 'BEARISH'; // Lower Low + Lower High = structure baissière
+  return 'NEUTRAL';
+}
+
+// Calcule le niveau de support/résistance le plus proche sur M5
+function keyLevels(symbol) {
+  const c = candles(symbol, 'm5');
+  if (c.length < 20) return null;
+
+  const recent   = c.slice(-20);
+  const resistance = Math.max(...recent.map(x => x.high));
+  const support    = Math.min(...recent.map(x => x.low));
+  const price      = recent[recent.length - 1].close;
+
+  return { resistance, support, price };
+}
+
+// Vérifie si la dernière bougie M1 confirme la direction
+function candleConfirm(symbol, direction) {
+  const c = candles(symbol, 'm1');
+  if (c.length < 2) return false;
+  const last = c[c.length - 1];
+  const prev = c[c.length - 2];
+
+  if (direction === 'BUY') {
+    // Bougie haussière + close au-dessus du close précédent
+    return last.close > last.open && last.close > prev.close;
+  } else {
+    // Bougie baissière + close en dessous du close précédent
+    return last.close < last.open && last.close < prev.close;
+  }
+}
+
+// ═══════════════════════════════════════════
+//  NOUVELLE STRATÉGIE — PRICE ACTION PURE
+//  Basée sur structure de marché + niveaux clés
+//  + confirmation bougie M1
+//  + RSI comme filtre extrêmes uniquement
+// ═══════════════════════════════════════════
+function stratPriceAction(symbol) {
+  const m5closes = closes(symbol, 'm5');
+  const m1closes = closes(symbol, 'm1');
+
+  if (m5closes.length < 20 || m1closes.length < 5) return null;
+
+  const structure = marketStructure(symbol);
+  const levels    = keyLevels(symbol);
+  const r         = rsi(m5closes);
+
+  if (!structure || !levels || !r) return null;
+  if (structure === 'NEUTRAL') return null;
+
+  const { resistance, support, price } = levels;
+  const rangeSize = resistance - support;
+  if (rangeSize <= 0) return null;
+
+  // Position relative du prix dans le range (0% = support, 100% = résistance)
+  const pricePos = (price - support) / rangeSize * 100;
+
+  // ── BUY ──────────────────────────────────
+  // Structure haussière + prix proche du support (bas du range)
+  // + bougie M1 confirme + RSI pas en surachat
+  if (
+    structure === 'BULLISH' &&
+    pricePos < 40 &&              // prix dans le bas du range
+    r < 70 &&                     // pas en surachat
+    candleConfirm(symbol, 'BUY')  // bougie M1 confirme
+  ) {
+    return {
+      signal:   'BUY',
+      strength: 3,
+      reason:   `PA BUY | Structure BULLISH | Prix bas range (${pricePos.toFixed(0)}%) | RSI:${r.toFixed(0)}`,
+    };
+  }
+
+  // ── SELL ─────────────────────────────────
+  // Structure baissière + prix proche de la résistance (haut du range)
+  // + bougie M1 confirme + RSI pas en survente
+  if (
+    structure === 'BEARISH' &&
+    pricePos > 60 &&               // prix dans le haut du range
+    r > 30 &&                      // pas en survente
+    candleConfirm(symbol, 'SELL')  // bougie M1 confirme
+  ) {
+    return {
+      signal:   'SELL',
+      strength: 3,
+      reason:   `PA SELL | Structure BEARISH | Prix haut range (${pricePos.toFixed(0)}%) | RSI:${r.toFixed(0)}`,
+    };
+  }
+
+  return null;
+}
+
+// ═══════════════════════════════════════════
+//  DÉTECTION DE RÉGIME (conservée pour info)
 // ═══════════════════════════════════════════
 function detectRegime(symbol) {
   const d = closes(symbol, 'm15');
-
-  // Minimum 30 bougies M15 (7h30) — réaliste
-  if (d.length < 30) {
-    BOT.lastRegime[symbol] = `WAIT (${d.length}/30 bougies M15)`;
+  if (d.length < 20) {
+    BOT.lastRegime[symbol] = `WAIT (${d.length}/20 bougies M15)`;
     return 'NONE';
   }
-
-  const e9    = ema(d, 9);
-  const e21   = ema(d, 21);
   const slope = trendSlope(d, 15);
   const vol   = volatility(d, 15);
-
-  if (!e9 || !e21 || slope === null || !vol) {
+  if (slope === null || !vol) {
     BOT.lastRegime[symbol] = 'indicateurs insuffisants';
     return 'NONE';
   }
-
-  const distance = Math.abs(e9 - e21) / e21 * 100;
-
-  // TREND si EMA séparées + pente claire
-  if (distance > 0.05 && Math.abs(slope) > 0.05) {
-    BOT.lastRegime[symbol] = `TREND (dist:${distance.toFixed(3)}% slope:${slope.toFixed(4)})`;
+  if (Math.abs(slope) > 0.05) {
+    BOT.lastRegime[symbol] = `TREND (slope:${slope.toFixed(4)})`;
     return 'TREND';
   }
-
-  // RANGE sinon
-  BOT.lastRegime[symbol] = `RANGE (dist:${distance.toFixed(3)}% vol:${vol.toFixed(2)}%)`;
+  BOT.lastRegime[symbol] = `RANGE (vol:${vol.toFixed(2)}%)`;
   return 'RANGE';
 }
 
 // ═══════════════════════════════════════════
-//  STRATÉGIE TREND
-//  Entre dans le sens de la tendance M15
-//  Sur pullback M1 + confirmation RSI M5
-// ═══════════════════════════════════════════
-function stratTrend(symbol) {
-  const m1  = closes(symbol, 'm1');
-  const m5  = closes(symbol, 'm5');
-  const m15 = closes(symbol, 'm15');
-
-  if (m1.length < 15 || m5.length < 15 || m15.length < 15) return null;
-
-  const e9_15  = ema(m15, 9);
-  const e21_15 = ema(m15, 21);
-  const e9_5   = ema(m5, 9);
-  const e21_5  = ema(m5, 21);
-  const r5     = rsi(m5);
-  const price  = m1[m1.length - 1];
-
-  if (!e9_15 || !e21_15 || !e9_5 || !e21_5 || !r5) return null;
-
-  // Tendance haussière M15 + M5 aligné + RSI momentum
-  // ✅ FIX — conditions assouplies pour permettre plus de BUY
-  if (e9_15 > e21_15 && e9_5 > e21_5 && r5 > 38 && r5 < 75) {
-    return { signal: 'BUY',  strength: 3, reason: `TREND BUY  | EMA M15+M5 haussières | RSI:${r5.toFixed(0)}` };
-  }
-
-  // Tendance baissière M15 + M5 aligné + RSI momentum
-  // ✅ FIX — fenêtre RSI SELL plus stricte pour éviter faux signaux
-  if (e9_15 < e21_15 && e9_5 < e21_5 && r5 < 58 && r5 > 25) {
-    return { signal: 'SELL', strength: 3, reason: `TREND SELL | EMA M15+M5 baissières | RSI:${r5.toFixed(0)}` };
-  }
-
-  return null;
-}
-
-// ═══════════════════════════════════════════
-//  STRATÉGIE RANGE
-//  Rebond sur les extrêmes de Bollinger M5
-//  Confirmé par RSI
-// ═══════════════════════════════════════════
-function stratRange(symbol) {
-  const m5    = closes(symbol, 'm5');
-  if (m5.length < 22) return null;
-
-  const bb    = bollinger(m5);
-  const r     = rsi(m5);
-  const price = m5[m5.length - 1];
-  const prev  = m5[m5.length - 2];
-
-  if (!bb || !r) return null;
-
-  // Prix touche ou passe sous la BB basse + RSI survente
-  if (price <= bb.lower * 1.002 && r < 38) {
-    return { signal: 'BUY',  strength: 2, reason: `RANGE BUY  | Prix BB basse | RSI:${r.toFixed(0)}` };
-  }
-
-  // Prix touche ou passe sur la BB haute + RSI surachat
-  if (price >= bb.upper * 0.998 && r > 62) {
-    return { signal: 'SELL', strength: 2, reason: `RANGE SELL | Prix BB haute | RSI:${r.toFixed(0)}` };
-  }
-
-  return null;
-}
-
-// ═══════════════════════════════════════════
-//  ANALYSE PAR MARCHÉ
+//  ANALYSE PAR MARCHÉ — Price Action uniquement
 // ═══════════════════════════════════════════
 function analyzeMarket(symbol) {
-  const regime = detectRegime(symbol);
-  if (regime === 'TREND') return stratTrend(symbol);
-  if (regime === 'RANGE') return stratRange(symbol);
-  return null;
+  detectRegime(symbol); // pour affichage info seulement
+  return stratPriceAction(symbol);
 }
 
 // ═══════════════════════════════════════════
@@ -412,8 +443,7 @@ function startBot() {
 function placeTrade(symbol, signal) {
   const stake    = parseFloat((BOT.balance * CONFIG.RISK_PCT).toFixed(2));
   if (stake < CONFIG.MIN_BALANCE) { console.log('❌ Balance trop faible'); return; }
-  // ✅ FIX — durée fixe 5 min pour plus de stabilité
-  const duration = 5;
+  const duration = CONFIG.DURATION;
   send({
     proposal:      1,
     contract_type: signal === 'BUY' ? 'CALL' : 'PUT',
@@ -494,8 +524,8 @@ app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.ht
 //  START
 // ═══════════════════════════════════════════
 app.listen(PORT, () => {
-  console.log(`\n🤖 V9 Bot — port ${PORT}`);
-  console.log(`📊 Risk:${CONFIG.RISK_PCT*100}% | Durée:5min fixe | Pause après ${CONFIG.MAX_LOSSES} pertes | Marché: R_75 uniquement`);
-  console.log(`🧠 Logique: Détection régime (TREND/RANGE) → stratégie adaptée — BUY/SELL équilibrés\n`);
+  console.log(`\n🤖 V10 Bot — port ${PORT}`);
+  console.log(`📊 Risk:${CONFIG.RISK_PCT*100}% | Durée:${CONFIG.DURATION}min | Pause après ${CONFIG.MAX_LOSSES} pertes | Marché: R_75`);
+  console.log(`🧠 Stratégie: Price Action Pure — Structure + Niveaux clés + Confirmation M1\n`);
   startBot();
 });
