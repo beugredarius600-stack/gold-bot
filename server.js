@@ -15,8 +15,8 @@ const CONFIG = {
   MT5_LOGIN:     '201259685',
   SYMBOL:        'Volatility 75 Index',
   RISK_PCT:      0.02,
-  SL_POINTS:     200,   // en points réels R_75 (prix * 0.01)
-  TP_RATIO:      2,     // TP = 2 × SL
+  SL_POINTS:     200,
+  TP_RATIO:      2,
   COOLDOWN_MS:   5 * 60 * 1000,
   LOSS_PAUSE_MS: 30 * 60 * 1000,
   MAX_LOSSES:    2,
@@ -53,7 +53,7 @@ const TF       = { m1: 60000, m5: 300000, m15: 900000 };
 const MAX_BARS = 150;
 
 // ═══════════════════════════════════════════
-//  WEBSOCKET HELPERS
+//  HELPERS
 // ═══════════════════════════════════════════
 function nextId() { return BOT.reqId++; }
 
@@ -72,14 +72,14 @@ function sendReq(obj) {
     setTimeout(function() {
       if (BOT.pending[id]) {
         delete BOT.pending[id];
-        reject(new Error('Timeout req ' + id));
+        reject(new Error('Timeout ' + id));
       }
     }, 15000);
   });
 }
 
 // ═══════════════════════════════════════════
-//  CANDLE BUILDER
+//  CANDLES
 // ═══════════════════════════════════════════
 function updateCandles(price, timestamp) {
   var tfs = ['m1', 'm5', 'm15'];
@@ -103,11 +103,15 @@ function updateCandles(price, timestamp) {
 }
 
 function getCloses(tf) {
-  return BOT.candles[tf].concat(BOT.current[tf] ? [BOT.current[tf]] : []).map(function(c) { return c.close; });
+  var arr = BOT.candles[tf].slice();
+  if (BOT.current[tf]) arr.push(BOT.current[tf]);
+  return arr.map(function(c) { return c.close; });
 }
 
 function getCandles(tf) {
-  return BOT.candles[tf].concat(BOT.current[tf] ? [BOT.current[tf]] : []);
+  var arr = BOT.candles[tf].slice();
+  if (BOT.current[tf]) arr.push(BOT.current[tf]);
+  return arr;
 }
 
 // ═══════════════════════════════════════════
@@ -139,12 +143,8 @@ function marketStructure() {
   var lastL  = lows[lows.length - 1];
   var prevH  = Math.max.apply(null, highs.slice(0, -1));
   var prevL  = Math.min.apply(null, lows.slice(0, -1));
-  var hh = lastH > prevH;
-  var ll = lastL < prevL;
-  var lh = lastH < prevH;
-  var hl = lastL > prevL;
-  if (hh && hl) return 'BULLISH';
-  if (ll && lh) return 'BEARISH';
+  if (lastH > prevH && lastL > prevL) return 'BULLISH';
+  if (lastH < prevH && lastL < prevL) return 'BEARISH';
   return 'NEUTRAL';
 }
 
@@ -171,37 +171,32 @@ function candleConfirm(direction) {
 function getSignal() {
   var m5closes = getCloses('m5');
   if (m5closes.length < 20) {
-    BOT.lastReason = 'Chauffe... M5:' + m5closes.length + '/20 bougies';
+    BOT.lastReason = 'Chauffe... M5:' + m5closes.length + '/20';
     return null;
   }
   var structure = marketStructure();
   var levels    = keyLevels();
   var r         = rsi(m5closes);
-
   if (!structure || !levels || !r) return null;
-
   if (structure === 'NEUTRAL') {
-    BOT.lastReason = 'Structure NEUTRAL — attente';
+    BOT.lastReason = 'NEUTRAL — attente';
     return null;
   }
-
   var rangeSize = levels.resistance - levels.support;
   if (rangeSize <= 0) return null;
   var pricePos = (levels.price - levels.support) / rangeSize * 100;
-
   if (structure === 'BULLISH' && pricePos < 40 && r < 70 && candleConfirm('BUY')) {
     return { signal: 'BUY', reason: 'PA BUY | BULLISH | Pos:' + pricePos.toFixed(0) + '% | RSI:' + r.toFixed(0) };
   }
   if (structure === 'BEARISH' && pricePos > 60 && r > 30 && candleConfirm('SELL')) {
     return { signal: 'SELL', reason: 'PA SELL | BEARISH | Pos:' + pricePos.toFixed(0) + '% | RSI:' + r.toFixed(0) };
   }
-
-  BOT.lastReason = 'Structure:' + structure + ' | Pos:' + pricePos.toFixed(0) + '% | RSI:' + r.toFixed(0) + ' — attente setup';
+  BOT.lastReason = structure + ' Pos:' + pricePos.toFixed(0) + '% RSI:' + r.toFixed(0) + ' — attente';
   return null;
 }
 
 // ═══════════════════════════════════════════
-//  PLACER ORDRE MT5
+//  ORDRE MT5
 // ═══════════════════════════════════════════
 async function placeOrder(signal, price) {
   if (BOT.openOrder) return;
@@ -210,77 +205,65 @@ async function placeOrder(signal, price) {
 
   var sl      = CONFIG.SL_POINTS * 0.01;
   var tp      = sl * CONFIG.TP_RATIO;
-  var slPrice = signal === 'BUY' ? price - sl : price + sl;
-  var tpPrice = signal === 'BUY' ? price + tp : price - tp;
+  var slPrice = parseFloat((signal === 'BUY' ? price - sl : price + sl).toFixed(2));
+  var tpPrice = parseFloat((signal === 'BUY' ? price + tp : price - tp).toFixed(2));
   var lot     = Math.max(CONFIG.LOT_MIN, parseFloat(((BOT.balance * CONFIG.RISK_PCT) / sl).toFixed(2)));
-  var type    = signal === 'BUY' ? 0 : 1;
 
   try {
     var res = await sendReq({
       mt5_new_order: 1,
-      login:         CONFIG.MT5_LOGIN,
-      symbol:        CONFIG.SYMBOL,
-      volume:        lot,
-      type:          type,
-      price:         parseFloat(price.toFixed(2)),
-      sl:            parseFloat(slPrice.toFixed(2)),
-      tp:            parseFloat(tpPrice.toFixed(2)),
-      comment:       'v11-bot',
+      login:  CONFIG.MT5_LOGIN,
+      symbol: CONFIG.SYMBOL,
+      volume: lot,
+      type:   signal === 'BUY' ? 0 : 1,
+      price:  parseFloat(price.toFixed(2)),
+      sl:     slPrice,
+      tp:     tpPrice,
+      comment: 'v11',
     });
 
-    if (res.error) {
-      console.log('❌ Ordre refusé:', res.error.message);
-      return;
-    }
+    if (res.error) { console.log('❌ Ordre refusé:', res.error.message); return; }
 
     var orderId       = res.mt5_new_order && res.mt5_new_order.order;
     BOT.openOrder     = orderId;
     BOT.lastTradeTime = Date.now();
     BOT.nTrades++;
     BOT.lastSignal    = signal;
-
-    BOT.trades.unshift({
-      id: orderId, signal: signal, lot: lot,
-      price: parseFloat(price.toFixed(2)),
-      sl: parseFloat(slPrice.toFixed(2)),
-      tp: parseFloat(tpPrice.toFixed(2)),
-      time: new Date().toISOString(), status: 'open', pnl: null,
-    });
+    BOT.trades.unshift({ id: orderId, signal: signal, lot: lot, price: parseFloat(price.toFixed(2)), sl: slPrice, tp: tpPrice, time: new Date().toISOString(), status: 'open', pnl: null });
     if (BOT.trades.length > 50) BOT.trades.pop();
-
-    console.log('🚀 ' + signal + ' Lot:' + lot + ' Prix:' + price.toFixed(2) + ' SL:' + slPrice.toFixed(2) + ' TP:' + tpPrice.toFixed(2));
+    console.log('🚀 ' + signal + ' Lot:' + lot + ' SL:' + slPrice + ' TP:' + tpPrice);
   } catch(e) {
-    console.log('❌ Erreur ordre:', e.message);
+    console.log('❌ Ordre err:', e.message);
   }
 }
 
 // ═══════════════════════════════════════════
-//  SURVEILLANCE POSITIONS
+//  SURVEILLANCE + BALANCE
 // ═══════════════════════════════════════════
 async function checkPositions() {
   if (!BOT.openOrder || !BOT.mt5Ready) return;
   try {
     var res    = await sendReq({ mt5_get_orders: 1, login: CONFIG.MT5_LOGIN });
     var orders = (res.mt5_get_orders && res.mt5_get_orders.orders) || [];
-    var still  = orders.filter(function(o) { return o.order === BOT.openOrder; }).length > 0;
+    var still  = orders.some(function(o) { return o.order === BOT.openOrder; });
     if (!still) {
       try {
-        var hist   = await sendReq({ mt5_get_order_history: 1, login: CONFIG.MT5_LOGIN });
+        var hist    = await sendReq({ mt5_get_order_history: 1, login: CONFIG.MT5_LOGIN });
         var hOrders = (hist.mt5_get_order_history && hist.mt5_get_order_history.orders) || [];
-        var done   = hOrders.filter(function(o) { return o.order === BOT.openOrder; })[0];
-        var pnl    = done ? parseFloat(done.profit || 0) : 0;
-        var closed = BOT.openOrder;
+        var done    = hOrders.find(function(o) { return o.order === BOT.openOrder; });
+        var pnl     = done ? parseFloat(done.profit || 0) : 0;
+        var closed  = BOT.openOrder;
         BOT.openOrder = null;
         BOT.pnl += pnl;
         if (pnl >= 0) { BOT.wins++; BOT.lossStreak = 0; }
         else          { BOT.losses++; BOT.lossStreak++; }
-        var t = BOT.trades.filter(function(x) { return x.id === closed; })[0];
+        var t = BOT.trades.find(function(x) { return x.id === closed; });
         if (t) { t.status = pnl >= 0 ? 'win' : 'loss'; t.pnl = parseFloat(pnl.toFixed(2)); }
         console.log((pnl >= 0 ? '✅ WIN' : '❌ LOSS') + ' $' + Math.abs(pnl).toFixed(2) + ' PnL:$' + BOT.pnl.toFixed(2));
         if (BOT.lossStreak >= CONFIG.MAX_LOSSES) {
           BOT.pauseUntil = Date.now() + CONFIG.LOSS_PAUSE_MS;
           BOT.lossStreak = 0;
-          console.log('⏸️ PAUSE 30 min');
+          console.log('⏸️ PAUSE 30min');
         }
       } catch(e) { console.log('History err:', e.message); }
     }
@@ -291,12 +274,50 @@ async function syncBalance() {
   if (!BOT.mt5Ready) return;
   try {
     var b = await sendReq({ mt5_get_settings: 1, login: CONFIG.MT5_LOGIN });
-    BOT.balance = parseFloat((b.mt5_get_settings && b.mt5_get_settings.balance) || BOT.balance);
-  } catch(e) { console.log('syncBalance err:', e.message); }
+    if (b.mt5_get_settings && b.mt5_get_settings.balance) {
+      BOT.balance = parseFloat(b.mt5_get_settings.balance);
+    }
+  } catch(e) {}
 }
 
 // ═══════════════════════════════════════════
-//  DÉMARRAGE
+//  INIT MT5 — via mt5_login_list
+// ═══════════════════════════════════════════
+async function initMT5() {
+  try {
+    // Liste tous les comptes MT5 liés au token
+    var list = await sendReq({ mt5_login_list: 1 });
+    console.log('📋 Comptes MT5 liés:', JSON.stringify(list.mt5_login_list || list.error || 'aucun'));
+
+    var accounts = list.mt5_login_list || [];
+    if (accounts.length === 0) {
+      console.log('❌ Aucun compte MT5 lié à ce token Deriv');
+      console.log('ℹ️ Va sur app.deriv.com → Traders Hub → MT5 et relie ton compte');
+      return;
+    }
+
+    // Cherche le compte correspondant au login
+    var account = accounts.find(function(a) { return String(a.login) === CONFIG.MT5_LOGIN; });
+    if (!account) {
+      account = accounts[0]; // prend le premier si pas trouvé
+      console.log('ℹ️ Login utilisé:', account.login);
+    }
+
+    BOT.balance  = parseFloat(account.balance || 0);
+    BOT.mt5Ready = true;
+    console.log('✅ MT5 Ready — Login:' + account.login + ' Balance:$' + BOT.balance);
+
+    send({ ticks: CONFIG.SYMBOL, subscribe: 1 });
+    setInterval(checkPositions, 10000);
+    setInterval(syncBalance, 30000);
+
+  } catch(e) {
+    console.log('❌ initMT5 err:', e.message);
+  }
+}
+
+// ═══════════════════════════════════════════
+//  BOT START
 // ═══════════════════════════════════════════
 function startBot() {
   if (!CONFIG.DERIV_TOKEN) { console.log('❌ DERIV_TOKEN manquant'); return; }
@@ -313,7 +334,6 @@ function startBot() {
     var d;
     try { d = JSON.parse(raw); } catch(e) { return; }
 
-    // Résolution promesses
     if (d.req_id && BOT.pending[d.req_id]) {
       var cb = BOT.pending[d.req_id];
       delete BOT.pending[d.req_id];
@@ -321,45 +341,24 @@ function startBot() {
       return;
     }
 
-    // Auth Deriv → accès MT5
     if (d.msg_type === 'authorize') {
-      if (d.error) { console.log('❌ Auth échouée:', d.error.message); return; }
+      if (d.error) { console.log('❌ Auth:', d.error.message); return; }
       BOT.authorized = true;
-      console.log('✅ Deriv autorisé');
-
-      // Accès direct au compte MT5 via le token
-      try {
-        var settings = await sendReq({ mt5_get_settings: 1, login: CONFIG.MT5_LOGIN });
-        if (settings.error) {
-          console.log('❌ MT5 accès refusé:', settings.error.message);
-          console.log('ℹ️ Vérifier que le login MT5 est bien lié à ce token Deriv');
-          return;
-        }
-        BOT.mt5Ready = true;
-        BOT.balance  = parseFloat((settings.mt5_get_settings && settings.mt5_get_settings.balance) || 0);
-        console.log('✅ MT5 Ready — Balance: $' + BOT.balance);
-        send({ ticks: CONFIG.SYMBOL, subscribe: 1 });
-        setInterval(checkPositions, 10000);
-        setInterval(syncBalance, 30000);
-      } catch(e) {
-        console.log('❌ MT5 erreur:', e.message);
-      }
+      console.log('✅ Deriv autorisé — init MT5...');
+      await initMT5();
     }
 
-    // Ticks
     if (d.msg_type === 'tick') {
       var price = parseFloat(d.tick.quote);
       var ts    = d.tick.epoch ? d.tick.epoch * 1000 : Date.now();
       if (isNaN(price)) return;
       updateCandles(price, ts);
-
       if (!BOT.mt5Ready || BOT.openOrder) return;
       if (Date.now() < BOT.pauseUntil) {
-        BOT.lastReason = '⏸️ Pause — reprend dans ' + Math.round((BOT.pauseUntil - Date.now()) / 60000) + ' min';
+        BOT.lastReason = '⏸️ Pause — ' + Math.round((BOT.pauseUntil - Date.now()) / 60000) + 'min';
         return;
       }
       if (Date.now() - BOT.lastTradeTime < CONFIG.COOLDOWN_MS) return;
-
       var sig = getSignal();
       if (sig) {
         BOT.lastReason = sig.reason;
@@ -385,24 +384,16 @@ function startBot() {
 // ═══════════════════════════════════════════
 app.get('/status', function(req, res) {
   res.json({
-    version:     'V11-MT5',
-    authorized:  BOT.authorized,
-    mt5Ready:    BOT.mt5Ready,
-    balance:     BOT.balance,
-    pnl:         parseFloat(BOT.pnl.toFixed(2)),
-    wins:        BOT.wins,
-    losses:      BOT.losses,
-    nTrades:     BOT.nTrades,
-    winRate:     BOT.nTrades > 0 ? ((BOT.wins / BOT.nTrades) * 100).toFixed(1) + '%' : '--',
-    lossStreak:  BOT.lossStreak,
-    paused:      Date.now() < BOT.pauseUntil,
-    pauseRemain: Date.now() < BOT.pauseUntil ? Math.round((BOT.pauseUntil - Date.now()) / 60000) + ' min' : '0',
-    openOrder:   BOT.openOrder,
-    lastSignal:  BOT.lastSignal,
-    lastReason:  BOT.lastReason,
-    candles:     { m1: BOT.candles.m1.length, m5: BOT.candles.m5.length, m15: BOT.candles.m15.length },
-    trades:      BOT.trades.slice(0, 20),
-    config:      { symbol: CONFIG.SYMBOL, riskPct: CONFIG.RISK_PCT, slPoints: CONFIG.SL_POINTS, tpRatio: CONFIG.TP_RATIO },
+    version: 'V11-MT5', authorized: BOT.authorized, mt5Ready: BOT.mt5Ready,
+    balance: BOT.balance, pnl: parseFloat(BOT.pnl.toFixed(2)),
+    wins: BOT.wins, losses: BOT.losses, nTrades: BOT.nTrades,
+    winRate: BOT.nTrades > 0 ? ((BOT.wins / BOT.nTrades) * 100).toFixed(1) + '%' : '--',
+    lossStreak: BOT.lossStreak, paused: Date.now() < BOT.pauseUntil,
+    pauseRemain: Date.now() < BOT.pauseUntil ? Math.round((BOT.pauseUntil - Date.now()) / 60000) + 'min' : '0',
+    openOrder: BOT.openOrder, lastSignal: BOT.lastSignal, lastReason: BOT.lastReason,
+    candles: { m1: BOT.candles.m1.length, m5: BOT.candles.m5.length, m15: BOT.candles.m15.length },
+    trades: BOT.trades.slice(0, 20),
+    config: { symbol: CONFIG.SYMBOL, riskPct: CONFIG.RISK_PCT, slPoints: CONFIG.SL_POINTS, tpRatio: CONFIG.TP_RATIO },
   });
 });
 
@@ -418,9 +409,6 @@ app.get('/history', function(req, res) {
 app.get('/health', function(req, res) { res.json({ status: 'ok' }); });
 app.get('/', function(req, res) { res.sendFile(path.join(__dirname, 'public', 'index.html')); });
 
-// ═══════════════════════════════════════════
-//  START
-// ═══════════════════════════════════════════
 app.listen(PORT, function() {
   console.log('\n🤖 V11 MT5 Bot — port ' + PORT);
   console.log('📊 Risk:' + (CONFIG.RISK_PCT * 100) + '% | SL:' + CONFIG.SL_POINTS + 'pts | Ratio 1:' + CONFIG.TP_RATIO);
