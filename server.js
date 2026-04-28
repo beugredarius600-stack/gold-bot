@@ -2,7 +2,7 @@ const express = require('express');
 const WebSocket = require('ws');
 const path = require('path');
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 3000;
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -11,25 +11,27 @@ app.use(express.static(path.join(__dirname, 'public')));
 //  CONFIG
 // ═══════════════════════════════════════════
 const CONFIG = {
-  RISK_PCT:       0.02,            // 2% par trade
-  COOLDOWN_MS:    5 * 60 * 1000,   // 5 min entre trades — moins de trades mais meilleurs
-  LOSS_PAUSE_MS:  30 * 60 * 1000,  // pause 30 min
-  MAX_LOSSES:     2,               // pause après 2 pertes consécutives — protection renforcée
-  MIN_BALANCE:    0.35,
-  DURATION:       3,               // 3 min par trade — adapté à la volatilité R_75
+  LOGIN:         '201259685',
+  PASSWORD:      process.env.MT5_PASSWORD,       // variable Render
+  SERVER:        'Deriv-Demo',
+  SYMBOL:        'Volatility 75 Index',          // nom exact MT5 Deriv
+  RISK_PCT:      0.02,                           // 2% par trade
+  SL_PIPS:       50,                             // Stop Loss en points
+  TP_RATIO:      2,                              // TP = 2 × SL
+  COOLDOWN_MS:   5 * 60 * 1000,                  // 5 min entre trades
+  LOSS_PAUSE_MS: 30 * 60 * 1000,                 // pause 30 min
+  MAX_LOSSES:    2,                              // max pertes consécutives
+  LOT_MIN:       0.01,
 };
-
-const SYMBOLS = ['R_75']; // R_50 désactivé — performances insuffisantes
 
 // ═══════════════════════════════════════════
 //  STATE
 // ═══════════════════════════════════════════
 const BOT = {
   ws:            null,
-  token:         process.env.DERIV_TOKEN || null,
-  running:       false,
+  authorized:    false,
   balance:       0,
-  openContract:  null,
+  openOrder:     null,
   lastTradeTime: 0,
   lossStreak:    0,
   pauseUntil:    0,
@@ -38,41 +40,59 @@ const BOT = {
   losses:        0,
   nTrades:       0,
   lastSignal:    null,
-  lastSymbol:    null,
-  lastRegime:    {},
   lastReason:    '',
   trades:        [],
   rTimer:        null,
+  reqId:         1,
+  pending:       {},
+  candles:       { m1: [], m5: [], m15: [] },
+  current:       { m1: null, m5: null, m15: null },
 };
 
-// État indépendant par marché
-const MARKETS = {};
-for (const s of SYMBOLS) {
-  MARKETS[s] = {
-    candles: { m1: [], m5: [], m15: [] },
-    current: { m1: null, m5: null, m15: null },
-  };
+const TF       = { m1: 60000, m5: 300000, m15: 900000 };
+const MAX_BARS = 150;
+
+// ═══════════════════════════════════════════
+//  WEBSOCKET HELPERS
+// ═══════════════════════════════════════════
+function nextId() { return BOT.reqId++; }
+
+function send(obj) {
+  if (BOT.ws && BOT.ws.readyState === WebSocket.OPEN) {
+    BOT.ws.send(JSON.stringify(obj));
+  }
 }
 
-const TF = { m1: 60000, m5: 300000, m15: 900000 };
-const MAX_CANDLES = 120;
+function sendReq(obj) {
+  return new Promise((resolve, reject) => {
+    const id = nextId();
+    obj.req_id = id;
+    BOT.pending[id] = { resolve, reject };
+    send(obj);
+    setTimeout(() => {
+      if (BOT.pending[id]) {
+        delete BOT.pending[id];
+        reject(new Error('Timeout req ' + id));
+      }
+    }, 15000);
+  });
+}
 
 // ═══════════════════════════════════════════
 //  CANDLE BUILDER
 // ═══════════════════════════════════════════
-function updateCandles(symbol, price, timestamp) {
-  const M = MARKETS[symbol];
+function updateCandles(price, timestamp) {
   for (const tf of ['m1', 'm5', 'm15']) {
     const p = TF[tf];
     const t = Math.floor(timestamp / p) * p;
-    if (!M.current[tf] || M.current[tf].time !== t) {
-      if (M.current[tf]) {
-        M.candles[tf].push(M.current[tf]);
-        if (M.candles[tf].length > MAX_CANDLES) M.candles[tf].shift();
+    if (!BOT.current[tf] || BOT.current[tf].time !== t) {
+      if (BOT.current[tf]) {
+        BOT.candles[tf].push(BOT.current[tf]);
+        if (BOT.candles[tf].length > MAX_BARS) BOT.candles[tf].shift();
       }
-      M.current[tf] = { time: t, open: price, high: price, low: price, close: price };
+      BOT.current[tf] = { time: t, open: price, high: price, low: price, close: price };
     } else {
-      const c = M.current[tf];
+      const c = BOT.current[tf];
       c.high  = Math.max(c.high, price);
       c.low   = Math.min(c.low, price);
       c.close = price;
@@ -80,29 +100,17 @@ function updateCandles(symbol, price, timestamp) {
   }
 }
 
-function closes(symbol, tf) {
-  return [...MARKETS[symbol].candles[tf], MARKETS[symbol].current[tf]]
-    .filter(Boolean)
-    .map(c => c.close);
+function getCloses(tf) {
+  return [...BOT.candles[tf], BOT.current[tf]].filter(Boolean).map(c => c.close);
 }
 
-// Retourne les bougies complètes (open, high, low, close)
-function candles(symbol, tf) {
-  return [...MARKETS[symbol].candles[tf], MARKETS[symbol].current[tf]]
-    .filter(Boolean);
+function getCandles(tf) {
+  return [...BOT.candles[tf], BOT.current[tf]].filter(Boolean);
 }
 
 // ═══════════════════════════════════════════
 //  INDICATEURS
 // ═══════════════════════════════════════════
-function ema(d, n) {
-  if (d.length < n) return null;
-  const k = 2 / (n + 1);
-  let e = d.slice(0, n).reduce((a, b) => a + b, 0) / n;
-  for (let i = n; i < d.length; i++) e = d[i] * k + e * (1 - k);
-  return e;
-}
-
 function rsi(d, n = 14) {
   if (d.length < n + 1) return null;
   let g = 0, l = 0;
@@ -115,314 +123,261 @@ function rsi(d, n = 14) {
   return 100 - (100 / (1 + ag / al));
 }
 
-function bollinger(d, n = 20) {
-  if (d.length < n) return null;
-  const sl  = d.slice(-n);
-  const avg = sl.reduce((a, b) => a + b, 0) / n;
-  const std = Math.sqrt(sl.reduce((a, b) => a + Math.pow(b - avg, 2), 0) / n);
-  return { upper: avg + 2 * std, lower: avg - 2 * std, avg };
-}
-
-function trendSlope(d, n = 20) {
-  if (d.length < n) return null;
-  const sl = d.slice(-n);
-  const xm = (n - 1) / 2;
-  const ym = sl.reduce((a, b) => a + b, 0) / n;
-  let num = 0, den = 0;
-  for (let i = 0; i < n; i++) {
-    num += (i - xm) * (sl[i] - ym);
-    den += Math.pow(i - xm, 2);
-  }
-  return den === 0 ? 0 : num / den;
-}
-
-function volatility(d, n = 20) {
-  if (d.length < n) return null;
-  const sl  = d.slice(-n);
-  const avg = sl.reduce((a, b) => a + b, 0) / n;
-  return Math.sqrt(sl.reduce((a, b) => a + Math.pow(b - avg, 2), 0) / n) / avg * 100;
-}
-
 // ═══════════════════════════════════════════
-//  UTILITAIRES PRICE ACTION
+//  PRICE ACTION PURE
 // ═══════════════════════════════════════════
-
-// Détecte Higher High / Lower Low sur N bougies M5
-function marketStructure(symbol) {
-  const c = candles(symbol, 'm5');
+function marketStructure() {
+  const c = getCandles('m5');
   if (c.length < 10) return null;
-
   const recent = c.slice(-10);
   const highs  = recent.map(x => x.high);
   const lows   = recent.map(x => x.low);
-
   const hh = highs[highs.length - 1] > Math.max(...highs.slice(0, -1));
   const ll  = lows[lows.length - 1]  < Math.min(...lows.slice(0, -1));
   const lh  = highs[highs.length - 1] < Math.max(...highs.slice(0, -1));
   const hl  = lows[lows.length - 1]  > Math.min(...lows.slice(0, -1));
-
-  if (hh && hl) return 'BULLISH'; // Higher High + Higher Low = structure haussière
-  if (ll && lh) return 'BEARISH'; // Lower Low + Lower High = structure baissière
+  if (hh && hl) return 'BULLISH';
+  if (ll && lh) return 'BEARISH';
   return 'NEUTRAL';
 }
 
-// Calcule le niveau de support/résistance le plus proche sur M5
-function keyLevels(symbol) {
-  const c = candles(symbol, 'm5');
+function keyLevels() {
+  const c = getCandles('m5');
   if (c.length < 20) return null;
-
-  const recent   = c.slice(-20);
+  const recent     = c.slice(-20);
   const resistance = Math.max(...recent.map(x => x.high));
   const support    = Math.min(...recent.map(x => x.low));
   const price      = recent[recent.length - 1].close;
-
   return { resistance, support, price };
 }
 
-// Vérifie si la dernière bougie M1 confirme la direction
-function candleConfirm(symbol, direction) {
-  const c = candles(symbol, 'm1');
+function candleConfirm(direction) {
+  const c = getCandles('m1');
   if (c.length < 2) return false;
   const last = c[c.length - 1];
   const prev = c[c.length - 2];
-
-  if (direction === 'BUY') {
-    // Bougie haussière + close au-dessus du close précédent
-    return last.close > last.open && last.close > prev.close;
-  } else {
-    // Bougie baissière + close en dessous du close précédent
-    return last.close < last.open && last.close < prev.close;
-  }
+  if (direction === 'BUY')  return last.close > last.open && last.close > prev.close;
+  if (direction === 'SELL') return last.close < last.open && last.close < prev.close;
+  return false;
 }
 
-// ═══════════════════════════════════════════
-//  NOUVELLE STRATÉGIE — PRICE ACTION PURE
-//  Basée sur structure de marché + niveaux clés
-//  + confirmation bougie M1
-//  + RSI comme filtre extrêmes uniquement
-// ═══════════════════════════════════════════
-function stratPriceAction(symbol) {
-  const m5closes = closes(symbol, 'm5');
-  const m1closes = closes(symbol, 'm1');
-
-  if (m5closes.length < 20 || m1closes.length < 5) return null;
-
-  const structure = marketStructure(symbol);
-  const levels    = keyLevels(symbol);
+function getSignal() {
+  const m5closes = getCloses('m5');
+  if (m5closes.length < 20) {
+    BOT.lastReason = `Chauffe... M5: ${m5closes.length}/20 bougies`;
+    return null;
+  }
+  const structure = marketStructure();
+  const levels    = keyLevels();
   const r         = rsi(m5closes);
 
   if (!structure || !levels || !r) return null;
-  if (structure === 'NEUTRAL') return null;
+  if (structure === 'NEUTRAL') {
+    BOT.lastReason = 'Structure NEUTRAL — pas de signal';
+    return null;
+  }
 
   const { resistance, support, price } = levels;
   const rangeSize = resistance - support;
   if (rangeSize <= 0) return null;
 
-  // Position relative du prix dans le range (0% = support, 100% = résistance)
   const pricePos = (price - support) / rangeSize * 100;
 
-  // ── BUY ──────────────────────────────────
-  // Structure haussière + prix proche du support (bas du range)
-  // + bougie M1 confirme + RSI pas en surachat
-  if (
-    structure === 'BULLISH' &&
-    pricePos < 40 &&              // prix dans le bas du range
-    r < 70 &&                     // pas en surachat
-    candleConfirm(symbol, 'BUY')  // bougie M1 confirme
-  ) {
-    return {
-      signal:   'BUY',
-      strength: 3,
-      reason:   `PA BUY | Structure BULLISH | Prix bas range (${pricePos.toFixed(0)}%) | RSI:${r.toFixed(0)}`,
-    };
+  if (structure === 'BULLISH' && pricePos < 40 && r < 70 && candleConfirm('BUY')) {
+    return { signal: 'BUY', reason: `PA BUY | BULLISH | Pos:${pricePos.toFixed(0)}% | RSI:${r.toFixed(0)}` };
   }
 
-  // ── SELL ─────────────────────────────────
-  // Structure baissière + prix proche de la résistance (haut du range)
-  // + bougie M1 confirme + RSI pas en survente
-  if (
-    structure === 'BEARISH' &&
-    pricePos > 60 &&               // prix dans le haut du range
-    r > 30 &&                      // pas en survente
-    candleConfirm(symbol, 'SELL')  // bougie M1 confirme
-  ) {
-    return {
-      signal:   'SELL',
-      strength: 3,
-      reason:   `PA SELL | Structure BEARISH | Prix haut range (${pricePos.toFixed(0)}%) | RSI:${r.toFixed(0)}`,
-    };
+  if (structure === 'BEARISH' && pricePos > 60 && r > 30 && candleConfirm('SELL')) {
+    return { signal: 'SELL', reason: `PA SELL | BEARISH | Pos:${pricePos.toFixed(0)}% | RSI:${r.toFixed(0)}` };
   }
 
+  BOT.lastReason = `Structure:${structure} | Pos:${pricePos.toFixed(0)}% | RSI:${r ? r.toFixed(0) : '--'} — attente setup`;
   return null;
 }
 
 // ═══════════════════════════════════════════
-//  DÉTECTION DE RÉGIME (conservée pour info)
+//  CALCUL LOT
 // ═══════════════════════════════════════════
-function detectRegime(symbol) {
-  const d = closes(symbol, 'm15');
-  if (d.length < 20) {
-    BOT.lastRegime[symbol] = `WAIT (${d.length}/20 bougies M15)`;
-    return 'NONE';
-  }
-  const slope = trendSlope(d, 15);
-  const vol   = volatility(d, 15);
-  if (slope === null || !vol) {
-    BOT.lastRegime[symbol] = 'indicateurs insuffisants';
-    return 'NONE';
-  }
-  if (Math.abs(slope) > 0.05) {
-    BOT.lastRegime[symbol] = `TREND (slope:${slope.toFixed(4)})`;
-    return 'TREND';
-  }
-  BOT.lastRegime[symbol] = `RANGE (vol:${vol.toFixed(2)}%)`;
-  return 'RANGE';
+function calcLot(price) {
+  const riskAmount = BOT.balance * CONFIG.RISK_PCT;
+  const slAmount   = (CONFIG.SL_PIPS / 100) * price;
+  let lot = riskAmount / slAmount;
+  lot = Math.max(CONFIG.LOT_MIN, parseFloat(lot.toFixed(2)));
+  return lot;
 }
 
 // ═══════════════════════════════════════════
-//  ANALYSE PAR MARCHÉ — Price Action uniquement
+//  PLACER ORDRE MT5
 // ═══════════════════════════════════════════
-function analyzeMarket(symbol) {
-  detectRegime(symbol); // pour affichage info seulement
-  return stratPriceAction(symbol);
-}
+async function placeOrder(signal, price) {
+  if (BOT.openOrder) return;
+  if (Date.now() < BOT.pauseUntil) return;
+  if (Date.now() - BOT.lastTradeTime < CONFIG.COOLDOWN_MS) return;
 
-// ═══════════════════════════════════════════
-//  SCANNER — CHOISIT LE MEILLEUR SETUP
-// ═══════════════════════════════════════════
-function scanMarkets() {
-  let best = null;
-  for (const symbol of SYMBOLS) {
-    const res = analyzeMarket(symbol);
-    if (!res) continue;
-    if (!best || res.strength > best.strength) {
-      best = { symbol, ...res };
+  const lot  = calcLot(price);
+  const sl   = CONFIG.SL_PIPS * 0.01;
+  const tp   = CONFIG.SL_PIPS * CONFIG.TP_RATIO * 0.01;
+  const type = signal === 'BUY' ? 0 : 1;
+
+  const slPrice = signal === 'BUY' ? price - sl : price + sl;
+  const tpPrice = signal === 'BUY' ? price + tp : price - tp;
+
+  try {
+    const res = await sendReq({
+      mt5_new_order: 1,
+      login:         CONFIG.LOGIN,
+      symbol:        CONFIG.SYMBOL,
+      volume:        lot,
+      type,
+      price,
+      sl:            parseFloat(slPrice.toFixed(2)),
+      tp:            parseFloat(tpPrice.toFixed(2)),
+      comment:       'gold-bot-v11',
+    });
+
+    if (res.error) {
+      console.log('❌ Ordre refusé:', res.error.message);
+      return;
     }
+
+    const orderId    = res.mt5_new_order?.order;
+    BOT.openOrder    = orderId;
+    BOT.lastTradeTime = Date.now();
+    BOT.nTrades++;
+    BOT.lastSignal   = signal;
+
+    BOT.trades.unshift({
+      id:     orderId,
+      signal,
+      lot,
+      price:  parseFloat(price.toFixed(2)),
+      sl:     parseFloat(slPrice.toFixed(2)),
+      tp:     parseFloat(tpPrice.toFixed(2)),
+      time:   new Date().toISOString(),
+      status: 'open',
+      pnl:    null,
+    });
+    if (BOT.trades.length > 50) BOT.trades.pop();
+
+    console.log(`🚀 ${signal} | Lot:${lot} | Prix:${price.toFixed(2)} | SL:${slPrice.toFixed(2)} | TP:${tpPrice.toFixed(2)}`);
+  } catch(e) {
+    console.log('❌ Erreur ordre:', e.message);
   }
-  if (best) BOT.lastReason = `${best.symbol} | ${best.reason}`;
-  else      BOT.lastReason = `Régimes: ${SYMBOLS.map(s => `${s}:${BOT.lastRegime[s] || 'WAIT'}`).join(' | ')}`;
-  return best;
 }
 
 // ═══════════════════════════════════════════
-//  WEBSOCKET
+//  SURVEILLANCE POSITIONS
 // ═══════════════════════════════════════════
-function send(o) {
-  if (BOT.ws && BOT.ws.readyState === WebSocket.OPEN) BOT.ws.send(JSON.stringify(o));
+async function checkPositions() {
+  if (!BOT.openOrder || !BOT.authorized) return;
+  try {
+    const res    = await sendReq({ mt5_get_orders: 1, login: CONFIG.LOGIN });
+    const orders = res.mt5_get_orders?.orders || [];
+    const still  = orders.find(o => o.order === BOT.openOrder);
+
+    if (!still) {
+      const hist = await sendReq({ mt5_get_order_history: 1, login: CONFIG.LOGIN });
+      const done = (hist.mt5_get_order_history?.orders || []).find(o => o.order === BOT.openOrder);
+      const pnl  = done ? parseFloat(done.profit || 0) : 0;
+
+      BOT.pnl      += pnl;
+      const closedId = BOT.openOrder;
+      BOT.openOrder  = null;
+
+      if (pnl >= 0) { BOT.wins++; BOT.lossStreak = 0; }
+      else          { BOT.losses++; BOT.lossStreak++; }
+
+      const t = BOT.trades.find(x => x.id === closedId);
+      if (t) { t.status = pnl >= 0 ? 'win' : 'loss'; t.pnl = parseFloat(pnl.toFixed(2)); }
+
+      console.log(`${pnl >= 0 ? '✅ WIN' : '❌ LOSS'} $${Math.abs(pnl).toFixed(2)} | PnL total:$${BOT.pnl.toFixed(2)} | WR:${((BOT.wins / BOT.nTrades) * 100).toFixed(1)}%`);
+
+      if (BOT.lossStreak >= CONFIG.MAX_LOSSES) {
+        BOT.pauseUntil = Date.now() + CONFIG.LOSS_PAUSE_MS;
+        BOT.lossStreak = 0;
+        console.log('⏸️ PAUSE 30 min activée');
+      }
+    }
+  } catch(e) {
+    console.log('Erreur checkPositions:', e.message);
+  }
 }
 
+// ═══════════════════════════════════════════
+//  DÉMARRAGE BOT
+// ═══════════════════════════════════════════
 function startBot() {
-  if (!BOT.token) { console.log('❌ No token'); return; }
-  if (BOT.ws) { try { BOT.ws.terminate(); } catch(e) {} }
+  if (!CONFIG.PASSWORD) {
+    console.log('❌ MT5_PASSWORD manquant — ajoute la variable dans Render');
+    return;
+  }
 
-  console.log('🤖 V8 Bot starting...');
+  console.log('🤖 V11 MT5 Bot starting...');
   BOT.ws = new WebSocket('wss://ws.binaryws.com/websockets/v3?app_id=1089&l=EN&brand=deriv');
 
   BOT.ws.on('open', () => {
-    console.log('✅ Connected');
-    send({ authorize: BOT.token });
+    console.log('✅ WebSocket connecté');
+    send({
+      mt5_login: 1,
+      login:     CONFIG.LOGIN,
+      password:  CONFIG.PASSWORD,
+      server:    CONFIG.SERVER,
+    });
   });
 
-  BOT.ws.on('message', (msg) => {
+  BOT.ws.on('message', async (msg) => {
     try {
       const d = JSON.parse(msg);
 
-      if (d.msg_type === 'authorize') {
-        if (d.error) { console.log('❌ Auth failed:', d.error.message); return; }
-        BOT.balance = parseFloat(d.authorize.balance);
-        BOT.running = true;
-        console.log(`✅ Authorized — $${BOT.balance}`);
-        send({ balance: 1, subscribe: 1 });
-        // Souscrire aux deux marchés
-        SYMBOLS.forEach(s => send({ ticks: s, subscribe: 1 }));
+      if (d.req_id && BOT.pending[d.req_id]) {
+        const { resolve, reject } = BOT.pending[d.req_id];
+        delete BOT.pending[d.req_id];
+        if (d.error) reject(d); else resolve(d);
+        return;
       }
 
-      if (d.msg_type === 'balance' && d.balance) {
-        BOT.balance = parseFloat(d.balance.balance);
+      if (d.msg_type === 'mt5_login') {
+        if (d.error) {
+          console.log('❌ MT5 Login échoué:', d.error.message);
+          return;
+        }
+        BOT.authorized = true;
+        console.log(`✅ MT5 Autorisé — ${CONFIG.SERVER}`);
+
+        try {
+          const bal = await sendReq({ mt5_get_settings: 1, login: CONFIG.LOGIN });
+          BOT.balance = parseFloat(bal.mt5_get_settings?.balance || 0);
+          console.log(`💰 Balance: $${BOT.balance}`);
+        } catch(e) { console.log('Balance error:', e.message); }
+
+        send({ ticks: CONFIG.SYMBOL, subscribe: 1 });
+        setInterval(checkPositions, 10000);
+        setInterval(async () => {
+          try {
+            const b = await sendReq({ mt5_get_settings: 1, login: CONFIG.LOGIN });
+            BOT.balance = parseFloat(b.mt5_get_settings?.balance || BOT.balance);
+          } catch(e) {}
+        }, 30000);
       }
 
       if (d.msg_type === 'tick') {
-        const symbol = d.tick.symbol;
-        const price  = parseFloat(d.tick.quote);
+        const price = parseFloat(d.tick.quote);
+        const ts    = d.tick.epoch ? d.tick.epoch * 1000 : Date.now();
         if (isNaN(price)) return;
+        updateCandles(price, ts);
 
-        const ts = d.tick.epoch ? d.tick.epoch * 1000 : Date.now();
-        updateCandles(symbol, price, ts);
-
-        // Conditions de blocage
-        if (BOT.openContract) return;
+        if (!BOT.authorized || BOT.openOrder) return;
         if (Date.now() < BOT.pauseUntil) {
-          const reste = Math.round((BOT.pauseUntil - Date.now()) / 60000);
-          BOT.lastReason = `⏸️ Pause protection — reprend dans ${reste} min`;
+          BOT.lastReason = `⏸️ Pause — reprend dans ${Math.round((BOT.pauseUntil - Date.now()) / 60000)} min`;
           return;
         }
         if (Date.now() - BOT.lastTradeTime < CONFIG.COOLDOWN_MS) return;
 
-        const best = scanMarkets();
-        if (best) {
-          console.log(`🚀 SIGNAL: ${best.signal} sur ${best.symbol} | ${best.reason}`);
-          BOT.lastSignal = best.signal;
-          BOT.lastSymbol = best.symbol;
-          BOT.lastTradeTime = Date.now();
-          placeTrade(best.symbol, best.signal);
-        }
-      }
-
-      if (d.msg_type === 'proposal') {
-        if (d.error) { console.log('❌ Proposal:', d.error.message); return; }
-        send({ buy: d.proposal.id, price: d.proposal.ask_price });
-      }
-
-      if (d.msg_type === 'buy') {
-        if (d.error) { console.log('❌ Buy:', d.error.message); return; }
-        BOT.openContract = d.buy.contract_id;
-        BOT.nTrades++;
-        BOT.trades.unshift({
-          id:     d.buy.contract_id,
-          signal: BOT.lastSignal,
-          symbol: BOT.lastSymbol,
-          stake:  parseFloat(d.buy.buy_price),
-          time:   new Date().toISOString(),
-          status: 'pending',
-          pnl:    null,
-        });
-        // ✅ FIX — garder 50 trades en mémoire (au lieu de 20)
-        if (BOT.trades.length > 50) BOT.trades.pop();
-        console.log(`🔵 Trade #${BOT.nTrades} — ${BOT.lastSignal} ${BOT.lastSymbol} — $${d.buy.buy_price}`);
-        send({ proposal_open_contract: 1, contract_id: d.buy.contract_id, subscribe: 1 });
-      }
-
-      if (d.msg_type === 'proposal_open_contract') {
-        const c = d.proposal_open_contract;
-        if (!c) return;
-        if (c.status === 'sold' || c.is_expired) {
-          const pnl = parseFloat(c.profit || 0);
-          BOT.pnl        += pnl;
-          BOT.openContract = null;
-
-          if (pnl >= 0) {
-            BOT.wins++;
-            BOT.lossStreak = 0;
-          } else {
-            BOT.losses++;
-            BOT.lossStreak++;
-          }
-
-          // Mise à jour du trade dans l'historique
-          const t = BOT.trades.find(x => x.id == c.contract_id);
-          if (t) { t.status = pnl >= 0 ? 'win' : 'loss'; t.pnl = pnl; }
-
-          const emoji = pnl >= 0 ? '✅ WIN' : '❌ LOSS';
-          console.log(`${emoji} $${Math.abs(pnl).toFixed(2)} | P&L:$${BOT.pnl.toFixed(2)} | Winrate:${((BOT.wins/BOT.nTrades)*100).toFixed(1)}% | Streak pertes:${BOT.lossStreak}`);
-
-          // Protection — pause après MAX_LOSSES pertes consécutives
-          if (BOT.lossStreak >= CONFIG.MAX_LOSSES) {
-            BOT.pauseUntil = Date.now() + CONFIG.LOSS_PAUSE_MS;
-            BOT.lossStreak = 0;
-            console.log(`⏸️ PAUSE 30 min après ${CONFIG.MAX_LOSSES} pertes consécutives`);
-          }
-
-          if (c.id) send({ forget: c.id });
+        const sig = getSignal();
+        if (sig) {
+          BOT.lastReason = sig.reason;
+          console.log(`📡 ${sig.signal} | ${sig.reason}`);
+          await placeOrder(sig.signal, price);
         }
       }
 
@@ -432,37 +387,21 @@ function startBot() {
   });
 
   BOT.ws.on('close', () => {
-    console.log('🔌 Disconnected — reconnect 5s');
+    console.log('🔌 Déconnecté — reconnect 5s');
+    BOT.authorized = false;
     clearTimeout(BOT.rTimer);
     BOT.rTimer = setTimeout(startBot, 5000);
   });
 
-  BOT.ws.on('error', (e) => console.log('WS error:', e.message));
-}
-
-function placeTrade(symbol, signal) {
-  const stake    = parseFloat((BOT.balance * CONFIG.RISK_PCT).toFixed(2));
-  if (stake < CONFIG.MIN_BALANCE) { console.log('❌ Balance trop faible'); return; }
-  const duration = CONFIG.DURATION;
-  send({
-    proposal:      1,
-    contract_type: signal === 'BUY' ? 'CALL' : 'PUT',
-    symbol,
-    duration,
-    duration_unit: 'm',
-    basis:         'stake',
-    amount:        stake,
-    currency:      'USD',
-  });
-  console.log(`📤 ${signal} ${symbol} | $${stake} | ${duration}min`);
+  BOT.ws.on('error', e => console.log('WS Error:', e.message));
 }
 
 // ═══════════════════════════════════════════
 //  ROUTES
 // ═══════════════════════════════════════════
 app.get('/status', (req, res) => res.json({
-  running:     BOT.running,
-  symbols:     SYMBOLS,
+  version:     'V11-MT5',
+  authorized:  BOT.authorized,
   balance:     BOT.balance,
   pnl:         parseFloat(BOT.pnl.toFixed(2)),
   wins:        BOT.wins,
@@ -472,48 +411,30 @@ app.get('/status', (req, res) => res.json({
   lossStreak:  BOT.lossStreak,
   paused:      Date.now() < BOT.pauseUntil,
   pauseRemain: Date.now() < BOT.pauseUntil ? Math.round((BOT.pauseUntil - Date.now()) / 60000) + ' min' : '0',
+  openOrder:   BOT.openOrder,
   lastSignal:  BOT.lastSignal,
-  lastSymbol:  BOT.lastSymbol,
   lastReason:  BOT.lastReason,
-  regimes:     BOT.lastRegime,
-  candles: {
-    R_75: { m1: MARKETS['R_75']?.candles.m1.length, m5: MARKETS['R_75']?.candles.m5.length, m15: MARKETS['R_75']?.candles.m15.length },
+  candles:     { m1: BOT.candles.m1.length, m5: BOT.candles.m5.length, m15: BOT.candles.m15.length },
+  trades:      BOT.trades.slice(0, 20),
+  config: {
+    symbol:    CONFIG.SYMBOL,
+    riskPct:   CONFIG.RISK_PCT,
+    slPips:    CONFIG.SL_PIPS,
+    tpRatio:   CONFIG.TP_RATIO,
+    maxLosses: CONFIG.MAX_LOSSES,
   },
-  // ✅ FIX — retourne les 20 derniers trades (au lieu de 10)
-  trades:    BOT.trades.slice(0, 20),
-  config:    CONFIG,
 }));
 
-// ✅ NOUVEAU — endpoint /history avec stats complètes par paire
 app.get('/history', (req, res) => {
-  const stats = {};
-  for (const s of SYMBOLS) {
-    const symTrades = BOT.trades.filter(t => t.symbol === s && t.status !== 'pending');
-    const wins      = symTrades.filter(t => t.status === 'win').length;
-    const losses    = symTrades.filter(t => t.status === 'loss').length;
-    const total     = wins + losses;
-    const pnl       = symTrades.reduce((sum, t) => sum + (t.pnl || 0), 0);
-    const buys      = symTrades.filter(t => t.signal === 'BUY').length;
-    const sells     = symTrades.filter(t => t.signal === 'SELL').length;
-    stats[s] = {
-      wins,
-      losses,
-      total,
-      winRate:  total > 0 ? ((wins / total) * 100).toFixed(1) + '%' : '--',
-      pnl:      parseFloat(pnl.toFixed(2)),
-      buys,
-      sells,
-    };
-  }
-
+  const wins   = BOT.trades.filter(t => t.status === 'win').length;
+  const losses = BOT.trades.filter(t => t.status === 'loss').length;
+  const total  = wins + losses;
   res.json({
-    totalTrades:   BOT.nTrades,
-    globalWins:    BOT.wins,
-    globalLosses:  BOT.losses,
-    globalWinRate: BOT.nTrades > 0 ? ((BOT.wins / BOT.nTrades) * 100).toFixed(1) + '%' : '--',
-    globalPnl:     parseFloat(BOT.pnl.toFixed(2)),
-    bySymbol:      stats,
-    allTrades:     BOT.trades,
+    totalTrades: BOT.nTrades,
+    wins, losses,
+    winRate: total > 0 ? ((wins / total) * 100).toFixed(1) + '%' : '--',
+    pnl:     parseFloat(BOT.pnl.toFixed(2)),
+    trades:  BOT.trades,
   });
 });
 
@@ -524,8 +445,8 @@ app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.ht
 //  START
 // ═══════════════════════════════════════════
 app.listen(PORT, () => {
-  console.log(`\n🤖 V10 Bot — port ${PORT}`);
-  console.log(`📊 Risk:${CONFIG.RISK_PCT*100}% | Durée:${CONFIG.DURATION}min | Pause après ${CONFIG.MAX_LOSSES} pertes | Marché: R_75`);
-  console.log(`🧠 Stratégie: Price Action Pure — Structure + Niveaux clés + Confirmation M1\n`);
+  console.log(`\n🤖 V11 MT5 Bot — port ${PORT}`);
+  console.log(`📊 Risk:${CONFIG.RISK_PCT * 100}% | SL:${CONFIG.SL_PIPS}pts | TP:${CONFIG.SL_PIPS * CONFIG.TP_RATIO}pts | Ratio 1:${CONFIG.TP_RATIO}`);
+  console.log(`🧠 Price Action Pure + TP/SL réels via Deriv MT5\n`);
   startBot();
 });
