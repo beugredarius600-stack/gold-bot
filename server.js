@@ -11,16 +11,17 @@ app.use(express.static(path.join(__dirname, 'public')));
 //  CONFIG
 // ═══════════════════════════════════════════
 const CONFIG = {
+  DERIV_TOKEN:   process.env.DERIV_TOKEN,
   LOGIN:         '201259685',
-  PASSWORD:      process.env.MT5_PASSWORD,       // variable Render
-  SERVER:        'Deriv-Demo',          // Access Server: Ireland, Hedge
-  SYMBOL:        'Volatility 75 Index',          // nom exact MT5 Deriv
-  RISK_PCT:      0.02,                           // 2% par trade
-  SL_PIPS:       50,                             // Stop Loss en points
-  TP_RATIO:      2,                              // TP = 2 × SL
-  COOLDOWN_MS:   5 * 60 * 1000,                  // 5 min entre trades
-  LOSS_PAUSE_MS: 30 * 60 * 1000,                 // pause 30 min
-  MAX_LOSSES:    2,                              // max pertes consécutives
+  PASSWORD:      process.env.MT5_PASSWORD,
+  SERVER:        'Deriv-Demo',
+  SYMBOL:        'Volatility 75 Index',
+  RISK_PCT:      0.02,
+  SL_PIPS:       50,
+  TP_RATIO:      2,
+  COOLDOWN_MS:   5 * 60 * 1000,
+  LOSS_PAUSE_MS: 30 * 60 * 1000,
+  MAX_LOSSES:    2,
   LOT_MIN:       0.01,
 };
 
@@ -30,6 +31,7 @@ const CONFIG = {
 const BOT = {
   ws:            null,
   authorized:    false,
+  mt5Ready:      false,
   balance:       0,
   openOrder:     null,
   lastTradeTime: 0,
@@ -124,7 +126,7 @@ function rsi(d, n = 14) {
 }
 
 // ═══════════════════════════════════════════
-//  PRICE ACTION PURE
+//  PRICE ACTION
 // ═══════════════════════════════════════════
 function marketStructure() {
   const c = getCandles('m5');
@@ -164,7 +166,7 @@ function candleConfirm(direction) {
 function getSignal() {
   const m5closes = getCloses('m5');
   if (m5closes.length < 20) {
-    BOT.lastReason = `Chauffe... M5: ${m5closes.length}/20 bougies`;
+    BOT.lastReason = `Chauffe... M5:${m5closes.length}/20 bougies`;
     return null;
   }
   const structure = marketStructure();
@@ -172,8 +174,9 @@ function getSignal() {
   const r         = rsi(m5closes);
 
   if (!structure || !levels || !r) return null;
+
   if (structure === 'NEUTRAL') {
-    BOT.lastReason = 'Structure NEUTRAL — pas de signal';
+    BOT.lastReason = 'Structure NEUTRAL — attente';
     return null;
   }
 
@@ -191,7 +194,7 @@ function getSignal() {
     return { signal: 'SELL', reason: `PA SELL | BEARISH | Pos:${pricePos.toFixed(0)}% | RSI:${r.toFixed(0)}` };
   }
 
-  BOT.lastReason = `Structure:${structure} | Pos:${pricePos.toFixed(0)}% | RSI:${r ? r.toFixed(0) : '--'} — attente setup`;
+  BOT.lastReason = `Structure:${structure} | Pos:${pricePos.toFixed(0)}% | RSI:${r.toFixed(0)} — attente setup`;
   return null;
 }
 
@@ -214,11 +217,10 @@ async function placeOrder(signal, price) {
   if (Date.now() < BOT.pauseUntil) return;
   if (Date.now() - BOT.lastTradeTime < CONFIG.COOLDOWN_MS) return;
 
-  const lot  = calcLot(price);
-  const sl   = CONFIG.SL_PIPS * 0.01;
-  const tp   = CONFIG.SL_PIPS * CONFIG.TP_RATIO * 0.01;
-  const type = signal === 'BUY' ? 0 : 1;
-
+  const lot     = calcLot(price);
+  const sl      = CONFIG.SL_PIPS * 0.01;
+  const tp      = CONFIG.SL_PIPS * CONFIG.TP_RATIO * 0.01;
+  const type    = signal === 'BUY' ? 0 : 1;
   const slPrice = signal === 'BUY' ? price - sl : price + sl;
   const tpPrice = signal === 'BUY' ? price + tp : price - tp;
 
@@ -240,11 +242,11 @@ async function placeOrder(signal, price) {
       return;
     }
 
-    const orderId    = res.mt5_new_order?.order;
-    BOT.openOrder    = orderId;
+    const orderId     = res.mt5_new_order && res.mt5_new_order.order;
+    BOT.openOrder     = orderId;
     BOT.lastTradeTime = Date.now();
     BOT.nTrades++;
-    BOT.lastSignal   = signal;
+    BOT.lastSignal    = signal;
 
     BOT.trades.unshift({
       id:     orderId,
@@ -259,7 +261,7 @@ async function placeOrder(signal, price) {
     });
     if (BOT.trades.length > 50) BOT.trades.pop();
 
-    console.log(`🚀 ${signal} | Lot:${lot} | Prix:${price.toFixed(2)} | SL:${slPrice.toFixed(2)} | TP:${tpPrice.toFixed(2)}`);
+    console.log('🚀 ' + signal + ' | Lot:' + lot + ' | Prix:' + price.toFixed(2) + ' | SL:' + slPrice.toFixed(2) + ' | TP:' + tpPrice.toFixed(2));
   } catch(e) {
     console.log('❌ Erreur ordre:', e.message);
   }
@@ -269,33 +271,38 @@ async function placeOrder(signal, price) {
 //  SURVEILLANCE POSITIONS
 // ═══════════════════════════════════════════
 async function checkPositions() {
-  if (!BOT.openOrder || !BOT.authorized) return;
+  if (!BOT.openOrder || !BOT.mt5Ready) return;
+
   try {
     const res    = await sendReq({ mt5_get_orders: 1, login: CONFIG.LOGIN });
-    const orders = res.mt5_get_orders?.orders || [];
-    const still  = orders.find(o => o.order === BOT.openOrder);
+    const orders = (res.mt5_get_orders && res.mt5_get_orders.orders) || [];
+    const still  = orders.find(function(o) { return o.order === BOT.openOrder; });
 
     if (!still) {
-      const hist = await sendReq({ mt5_get_order_history: 1, login: CONFIG.LOGIN });
-      const done = (hist.mt5_get_order_history?.orders || []).find(o => o.order === BOT.openOrder);
-      const pnl  = done ? parseFloat(done.profit || 0) : 0;
+      try {
+        const hist   = await sendReq({ mt5_get_order_history: 1, login: CONFIG.LOGIN });
+        const done   = ((hist.mt5_get_order_history && hist.mt5_get_order_history.orders) || []).find(function(o) { return o.order === BOT.openOrder; });
+        const pnl    = done ? parseFloat(done.profit || 0) : 0;
+        const closed = BOT.openOrder;
 
-      BOT.pnl      += pnl;
-      const closedId = BOT.openOrder;
-      BOT.openOrder  = null;
+        BOT.pnl      += pnl;
+        BOT.openOrder = null;
 
-      if (pnl >= 0) { BOT.wins++; BOT.lossStreak = 0; }
-      else          { BOT.losses++; BOT.lossStreak++; }
+        if (pnl >= 0) { BOT.wins++; BOT.lossStreak = 0; }
+        else          { BOT.losses++; BOT.lossStreak++; }
 
-      const t = BOT.trades.find(x => x.id === closedId);
-      if (t) { t.status = pnl >= 0 ? 'win' : 'loss'; t.pnl = parseFloat(pnl.toFixed(2)); }
+        const t = BOT.trades.find(function(x) { return x.id === closed; });
+        if (t) { t.status = pnl >= 0 ? 'win' : 'loss'; t.pnl = parseFloat(pnl.toFixed(2)); }
 
-      console.log(`${pnl >= 0 ? '✅ WIN' : '❌ LOSS'} $${Math.abs(pnl).toFixed(2)} | PnL total:$${BOT.pnl.toFixed(2)} | WR:${((BOT.wins / BOT.nTrades) * 100).toFixed(1)}%`);
+        console.log((pnl >= 0 ? '✅ WIN' : '❌ LOSS') + ' $' + Math.abs(pnl).toFixed(2) + ' | PnL:$' + BOT.pnl.toFixed(2) + ' | WR:' + ((BOT.wins / BOT.nTrades) * 100).toFixed(1) + '%');
 
-      if (BOT.lossStreak >= CONFIG.MAX_LOSSES) {
-        BOT.pauseUntil = Date.now() + CONFIG.LOSS_PAUSE_MS;
-        BOT.lossStreak = 0;
-        console.log('⏸️ PAUSE 30 min activée');
+        if (BOT.lossStreak >= CONFIG.MAX_LOSSES) {
+          BOT.pauseUntil = Date.now() + CONFIG.LOSS_PAUSE_MS;
+          BOT.lossStreak = 0;
+          console.log('⏸️ PAUSE 30 min activée');
+        }
+      } catch(e) {
+        console.log('Erreur history:', e.message);
       }
     }
   } catch(e) {
@@ -304,9 +311,26 @@ async function checkPositions() {
 }
 
 // ═══════════════════════════════════════════
+//  SYNC BALANCE
+// ═══════════════════════════════════════════
+async function syncBalance() {
+  if (!BOT.mt5Ready) return;
+  try {
+    const b = await sendReq({ mt5_get_settings: 1, login: CONFIG.LOGIN });
+    BOT.balance = parseFloat((b.mt5_get_settings && b.mt5_get_settings.balance) || BOT.balance);
+  } catch(e) {
+    console.log('Erreur syncBalance:', e.message);
+  }
+}
+
+// ═══════════════════════════════════════════
 //  DÉMARRAGE BOT
 // ═══════════════════════════════════════════
 function startBot() {
+  if (!CONFIG.DERIV_TOKEN) {
+    console.log('❌ DERIV_TOKEN manquant');
+    return;
+  }
   if (!CONFIG.PASSWORD) {
     console.log('❌ MT5_PASSWORD manquant — ajoute la variable dans Render');
     return;
@@ -315,146 +339,160 @@ function startBot() {
   console.log('🤖 V11 MT5 Bot starting...');
   BOT.ws = new WebSocket('wss://ws.binaryws.com/websockets/v3?app_id=1089&l=EN&brand=deriv');
 
-  BOT.ws.on('open', () => {
+  BOT.ws.on('open', function() {
     console.log('✅ WebSocket connecté');
-    // Étape 1 — S'authentifier avec le token Deriv existant
-    send({ authorize: process.env.DERIV_TOKEN });
+    send({ authorize: CONFIG.DERIV_TOKEN });
   });
 
-  BOT.ws.on('message', async (msg) => {
+  BOT.ws.on('message', async function(msg) {
+    let d;
     try {
-      const d = JSON.parse(msg);
+      d = JSON.parse(msg);
+    } catch(e) {
+      console.log('Parse error:', e.message);
+      return;
+    }
 
-      if (d.req_id && BOT.pending[d.req_id]) {
-        const { resolve, reject } = BOT.pending[d.req_id];
-        delete BOT.pending[d.req_id];
-        if (d.error) reject(d); else resolve(d);
+    // Résolution promesses en attente
+    if (d.req_id && BOT.pending[d.req_id]) {
+      const cb = BOT.pending[d.req_id];
+      delete BOT.pending[d.req_id];
+      if (d.error) cb.reject(d); else cb.resolve(d);
+      return;
+    }
+
+    // Étape 1 — Autorisation Deriv
+    if (d.msg_type === 'authorize') {
+      if (d.error) {
+        console.log('❌ Auth Deriv échouée:', d.error.message);
+        return;
+      }
+      console.log('✅ Deriv autorisé — login MT5...');
+      send({
+        mt5_login: 1,
+        login:     CONFIG.LOGIN,
+        password:  CONFIG.PASSWORD,
+        server:    CONFIG.SERVER,
+      });
+    }
+
+    // Étape 2 — Login MT5
+    if (d.msg_type === 'mt5_login') {
+      if (d.error) {
+        console.log('❌ MT5 Login échoué:', d.error.message);
+        return;
+      }
+      BOT.authorized = true;
+      BOT.mt5Ready   = true;
+      console.log('✅ MT5 Connecté — ' + CONFIG.SERVER);
+
+      await syncBalance();
+      console.log('💰 Balance: $' + BOT.balance);
+
+      send({ ticks: CONFIG.SYMBOL, subscribe: 1 });
+      setInterval(checkPositions, 10000);
+      setInterval(syncBalance, 30000);
+    }
+
+    // Ticks en temps réel
+    if (d.msg_type === 'tick') {
+      const price = parseFloat(d.tick.quote);
+      const ts    = d.tick.epoch ? d.tick.epoch * 1000 : Date.now();
+      if (isNaN(price)) return;
+
+      updateCandles(price, ts);
+
+      if (!BOT.mt5Ready || BOT.openOrder) return;
+
+      if (Date.now() < BOT.pauseUntil) {
+        BOT.lastReason = '⏸️ Pause — reprend dans ' + Math.round((BOT.pauseUntil - Date.now()) / 60000) + ' min';
         return;
       }
 
-      // Étape 1 — Autorisation Deriv réussie → login MT5
-      if (d.msg_type === 'authorize') {
-        if (d.error) { console.log('❌ Auth Deriv échouée:', d.error.message); return; }
-        console.log('✅ Deriv autorisé — connexion MT5...');
-        send({
-          mt5_login: 1,
-          login:     CONFIG.LOGIN,
-          password:  CONFIG.PASSWORD,
-          server:    CONFIG.SERVER,
-        });
+      if (Date.now() - BOT.lastTradeTime < CONFIG.COOLDOWN_MS) return;
+
+      const sig = getSignal();
+      if (sig) {
+        BOT.lastReason = sig.reason;
+        console.log('📡 ' + sig.signal + ' | ' + sig.reason);
+        await placeOrder(sig.signal, price);
       }
-
-      // Étape 2 — Login MT5
-        if (d.error) {
-          console.log('❌ MT5 Login échoué:', d.error.message);
-          return;
-        }
-        BOT.authorized = true;
-        console.log(`✅ MT5 Autorisé — ${CONFIG.SERVER}`);
-
-        try {
-          const bal = await sendReq({ mt5_get_settings: 1, login: CONFIG.LOGIN });
-          BOT.balance = parseFloat(bal.mt5_get_settings?.balance || 0);
-          console.log(`💰 Balance: $${BOT.balance}`);
-        } catch(e) { console.log('Balance error:', e.message); }
-
-        send({ ticks: CONFIG.SYMBOL, subscribe: 1 });
-        setInterval(checkPositions, 10000);
-        setInterval(async () => {
-          try {
-            const b = await sendReq({ mt5_get_settings: 1, login: CONFIG.LOGIN });
-            BOT.balance = parseFloat(b.mt5_get_settings?.balance || BOT.balance);
-          } catch(e) {}
-        }, 30000);
-      }
-
-      if (d.msg_type === 'tick') {
-        const price = parseFloat(d.tick.quote);
-        const ts    = d.tick.epoch ? d.tick.epoch * 1000 : Date.now();
-        if (isNaN(price)) return;
-        updateCandles(price, ts);
-
-        if (!BOT.authorized || BOT.openOrder) return;
-        if (Date.now() < BOT.pauseUntil) {
-          BOT.lastReason = `⏸️ Pause — reprend dans ${Math.round((BOT.pauseUntil - Date.now()) / 60000)} min`;
-          return;
-        }
-        if (Date.now() - BOT.lastTradeTime < CONFIG.COOLDOWN_MS) return;
-
-        const sig = getSignal();
-        if (sig) {
-          BOT.lastReason = sig.reason;
-          console.log(`📡 ${sig.signal} | ${sig.reason}`);
-          await placeOrder(sig.signal, price);
-        }
-      }
-
-    } catch(e) {
-      console.log('Parse error:', e.message);
     }
   });
 
-  BOT.ws.on('close', () => {
+  BOT.ws.on('close', function() {
     console.log('🔌 Déconnecté — reconnect 5s');
     BOT.authorized = false;
+    BOT.mt5Ready   = false;
     clearTimeout(BOT.rTimer);
     BOT.rTimer = setTimeout(startBot, 5000);
   });
 
-  BOT.ws.on('error', e => console.log('WS Error:', e.message));
+  BOT.ws.on('error', function(e) {
+    console.log('WS Error:', e.message);
+  });
 }
 
 // ═══════════════════════════════════════════
 //  ROUTES
 // ═══════════════════════════════════════════
-app.get('/status', (req, res) => res.json({
-  version:     'V11-MT5',
-  authorized:  BOT.authorized,
-  balance:     BOT.balance,
-  pnl:         parseFloat(BOT.pnl.toFixed(2)),
-  wins:        BOT.wins,
-  losses:      BOT.losses,
-  nTrades:     BOT.nTrades,
-  winRate:     BOT.nTrades > 0 ? ((BOT.wins / BOT.nTrades) * 100).toFixed(1) + '%' : '--',
-  lossStreak:  BOT.lossStreak,
-  paused:      Date.now() < BOT.pauseUntil,
-  pauseRemain: Date.now() < BOT.pauseUntil ? Math.round((BOT.pauseUntil - Date.now()) / 60000) + ' min' : '0',
-  openOrder:   BOT.openOrder,
-  lastSignal:  BOT.lastSignal,
-  lastReason:  BOT.lastReason,
-  candles:     { m1: BOT.candles.m1.length, m5: BOT.candles.m5.length, m15: BOT.candles.m15.length },
-  trades:      BOT.trades.slice(0, 20),
-  config: {
-    symbol:    CONFIG.SYMBOL,
-    riskPct:   CONFIG.RISK_PCT,
-    slPips:    CONFIG.SL_PIPS,
-    tpRatio:   CONFIG.TP_RATIO,
-    maxLosses: CONFIG.MAX_LOSSES,
-  },
-}));
+app.get('/status', function(req, res) {
+  res.json({
+    version:     'V11-MT5',
+    authorized:  BOT.authorized,
+    mt5Ready:    BOT.mt5Ready,
+    balance:     BOT.balance,
+    pnl:         parseFloat(BOT.pnl.toFixed(2)),
+    wins:        BOT.wins,
+    losses:      BOT.losses,
+    nTrades:     BOT.nTrades,
+    winRate:     BOT.nTrades > 0 ? ((BOT.wins / BOT.nTrades) * 100).toFixed(1) + '%' : '--',
+    lossStreak:  BOT.lossStreak,
+    paused:      Date.now() < BOT.pauseUntil,
+    pauseRemain: Date.now() < BOT.pauseUntil ? Math.round((BOT.pauseUntil - Date.now()) / 60000) + ' min' : '0',
+    openOrder:   BOT.openOrder,
+    lastSignal:  BOT.lastSignal,
+    lastReason:  BOT.lastReason,
+    candles:     { m1: BOT.candles.m1.length, m5: BOT.candles.m5.length, m15: BOT.candles.m15.length },
+    trades:      BOT.trades.slice(0, 20),
+    config: {
+      symbol:    CONFIG.SYMBOL,
+      riskPct:   CONFIG.RISK_PCT,
+      slPips:    CONFIG.SL_PIPS,
+      tpRatio:   CONFIG.TP_RATIO,
+      maxLosses: CONFIG.MAX_LOSSES,
+    },
+  });
+});
 
-app.get('/history', (req, res) => {
-  const wins   = BOT.trades.filter(t => t.status === 'win').length;
-  const losses = BOT.trades.filter(t => t.status === 'loss').length;
+app.get('/history', function(req, res) {
+  const wins   = BOT.trades.filter(function(t) { return t.status === 'win'; }).length;
+  const losses = BOT.trades.filter(function(t) { return t.status === 'loss'; }).length;
   const total  = wins + losses;
   res.json({
     totalTrades: BOT.nTrades,
-    wins, losses,
+    wins,
+    losses,
     winRate: total > 0 ? ((wins / total) * 100).toFixed(1) + '%' : '--',
     pnl:     parseFloat(BOT.pnl.toFixed(2)),
     trades:  BOT.trades,
   });
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
-app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+app.get('/health', function(req, res) {
+  res.json({ status: 'ok', time: new Date().toISOString() });
+});
+
+app.get('/', function(req, res) {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
 
 // ═══════════════════════════════════════════
 //  START
 // ═══════════════════════════════════════════
-app.listen(PORT, () => {
-  console.log(`\n🤖 V11 MT5 Bot — port ${PORT}`);
-  console.log(`📊 Risk:${CONFIG.RISK_PCT * 100}% | SL:${CONFIG.SL_PIPS}pts | TP:${CONFIG.SL_PIPS * CONFIG.TP_RATIO}pts | Ratio 1:${CONFIG.TP_RATIO}`);
-  console.log(`🧠 Price Action Pure + TP/SL réels via Deriv MT5\n`);
+app.listen(PORT, function() {
+  console.log('\n🤖 V11 MT5 Bot — port ' + PORT);
+  console.log('📊 Risk:' + (CONFIG.RISK_PCT * 100) + '% | SL:' + CONFIG.SL_PIPS + 'pts | TP:' + (CONFIG.SL_PIPS * CONFIG.TP_RATIO) + 'pts | Ratio 1:' + CONFIG.TP_RATIO);
+  console.log('🧠 Price Action Pure + TP/SL réels via Deriv MT5\n');
   startBot();
 });
