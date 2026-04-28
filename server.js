@@ -13,7 +13,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 const CONFIG = {
   LOGIN:         '201259685',
   PASSWORD:      process.env.MT5_PASSWORD,       // variable Render
-  SERVER:        'Deriv-Demo',
+  SERVER:        'Deriv-Demo',          // Access Server: Ireland, Hedge
   SYMBOL:        'Volatility 75 Index',          // nom exact MT5 Deriv
   RISK_PCT:      0.02,                           // 2% par trade
   SL_PIPS:       50,                             // Stop Loss en points
@@ -317,12 +317,8 @@ function startBot() {
 
   BOT.ws.on('open', () => {
     console.log('✅ WebSocket connecté');
-    send({
-      mt5_login: 1,
-      login:     CONFIG.LOGIN,
-      password:  CONFIG.PASSWORD,
-      server:    CONFIG.SERVER,
-    });
+    // Étape 1 — S'authentifier avec le token Deriv existant
+    send({ authorize: process.env.DERIV_TOKEN });
   });
 
   BOT.ws.on('message', async (msg) => {
@@ -336,7 +332,19 @@ function startBot() {
         return;
       }
 
-      if (d.msg_type === 'mt5_login') {
+      // Étape 1 — Autorisation Deriv réussie → login MT5
+      if (d.msg_type === 'authorize') {
+        if (d.error) { console.log('❌ Auth Deriv échouée:', d.error.message); return; }
+        console.log('✅ Deriv autorisé — connexion MT5...');
+        send({
+          mt5_login: 1,
+          login:     CONFIG.LOGIN,
+          password:  CONFIG.PASSWORD,
+          server:    CONFIG.SERVER,
+        });
+      }
+
+      // Étape 2 — Login MT5
         if (d.error) {
           console.log('❌ MT5 Login échoué:', d.error.message);
           return;
